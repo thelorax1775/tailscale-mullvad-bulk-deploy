@@ -1,13 +1,23 @@
-# bulkvpn
+# tailscale-mullvad-bulk-deploy
 
 **Bulk-deploy the Tailscale + Mullvad fail-closed kill-switch across every LXC container and VM on a Proxmox VE node — in one command.**
 
-`bulkvpn` walks every *running* guest on a Proxmox node and, for any guest that isn't already protected, it installs Tailscale (if missing), enrolls it into your tailnet, then deploys and schedules the [Mullvad kill-switch](https://github.com/thelorax1775/tailscale-mullvad-killswitch): an nftables fail-closed egress firewall plus a self-healing exit-node rotator on a 15-minute timer. Re-runs are idempotent — already-protected guests are skipped.
+`bulkvpn-deploy.sh` (the script keeps its original `bulkvpn` name) walks every *running* guest on a Proxmox node and, for any guest that isn't already protected, it installs Tailscale (if missing), enrolls it into your tailnet, then deploys and schedules the [Mullvad kill-switch](https://github.com/thelorax1775/tailscale-mullvad-killswitch): an nftables fail-closed egress firewall plus a self-healing exit-node rotator on a 15-minute timer. Re-runs are idempotent — already-protected guests are skipped.
 
 It combines two upstream projects by [@thelorax1775](https://github.com/thelorax1775):
 
-- **[tailscale-mullvad-killswitch](https://github.com/thelorax1775/tailscale-mullvad-killswitch)** — the per-host fail-closed setup (nftables ruleset + `mullvad-rotate.sh` + systemd units). Its files are vendored verbatim in [`assets/`](assets/).
-- **[TailAdjuster](https://github.com/thelorax1775/TailAdjuster)** — the bulk "scan every LXC/VM on a Proxmox node and act on each" pattern. `bulkvpn`'s enumeration, `pct exec` / `qm guest exec` mechanics, TUN handling, and idempotency checks follow it.
+- **[tailscale-mullvad-killswitch](https://github.com/thelorax1775/tailscale-mullvad-killswitch)** — the per-host fail-closed setup (nftables ruleset + `mullvad-rotate.sh` + systemd units). Its files are vendored in [`assets/`](assets/), extended here with templated LAN subnets and a LAN-bypass `ip rule` in `mullvad-rotate.sh`.
+- **[tailscale-bulk-join](https://github.com/thelorax1775/tailscale-bulk-join)** (formerly TailAdjuster) — the bulk "scan every LXC/VM on a Proxmox node and act on each" pattern. The enumeration, `pct exec` / `qm guest exec` mechanics, TUN handling, and idempotency checks follow it.
+
+## Features
+
+- One command per Proxmox node: covers running LXC containers and QEMU VMs.
+- Installs and enrolls Tailscale where it is missing, then deploys the Mullvad fail-closed kill-switch.
+- Fail-closed ordering: the drop-policy firewall is loaded only after Tailscale is up and a Mullvad exit node is visible.
+- Auto-detects each guest's LAN and keeps guests reachable to each other on the LAN.
+- Interactive guest picker (`whiptail`), or `SELECT_GUESTS` for automation.
+- Idempotent re-runs, `DRY_RUN=1` preview, `FORCE_REDEPLOY=1` to roll out changes.
+- Self-contained: assets are embedded in the script, nothing is fetched into guests after the firewall is up.
 
 ## What it does per guest
 
@@ -153,9 +163,9 @@ assets/
     mullvad-healthcheck.timer
 ```
 
-The `assets/` files are the single source of truth (vendored verbatim from the upstream kill-switch repo). `bulkvpn-deploy.sh` embeds identical copies inline so it can provision guests without fetching anything — handy since the kill-switch itself blocks egress. If you edit an asset, mirror the change into the matching `asset_*()` heredoc in the script.
+The `assets/` files are the single source of truth (vendored from the upstream kill-switch repo, with the LAN-subnet templating and LAN-bypass additions described above). `bulkvpn-deploy.sh` embeds identical copies inline so it can provision guests without fetching anything — handy since the kill-switch itself blocks egress. If you edit an asset, mirror the change into the matching `asset_*()` heredoc in the script.
 
-## Removing bulkvpn from individual guests
+## Removing the kill-switch from individual guests
 
 Deployment is idempotent, but there is no built-in *removal* — a guest stays
 protected until you tear the kill-switch off it by hand. This section covers
@@ -259,6 +269,10 @@ If you want a guest to stay unprotected on a given run, leave it unchecked in
 the interactive menu, or list only the guests you *do* want via `SELECT_GUESTS`
 (see [Choosing which guests get the kill-switch](#choosing-which-guests-get-the-kill-switch)).
 
+## Project status
+
+Working tool, last changed in four merged PRs (LAN auto-detect, cross-guest LAN reachability, `FORCE_REDEPLOY`, guest picker). There is no test suite or CI; behaviour described here comes from reading the script and has not been re-verified on a live Proxmox node for this README. Compared with tailscale-bulk-join, this script does not fail fast on a rejected auth key, does not reboot-and-retry a failed join, and installs prerequisites only via apt, dnf or yum (Alpine is skipped anyway as non-systemd), so a plain Tailscale-only rollout is still better served by that repo.
+
 ## Credits & license
 
-Kill-switch design and the vendored `assets/` files are from [tailscale-mullvad-killswitch](https://github.com/thelorax1775/tailscale-mullvad-killswitch); the bulk Proxmox deployment pattern is from [TailAdjuster](https://github.com/thelorax1775/TailAdjuster), both by [@thelorax1775](https://github.com/thelorax1775). Licensed under Apache-2.0 — see [LICENSE](LICENSE).
+Kill-switch design and the vendored `assets/` files are from [tailscale-mullvad-killswitch](https://github.com/thelorax1775/tailscale-mullvad-killswitch); the bulk Proxmox deployment pattern is from [tailscale-bulk-join](https://github.com/thelorax1775/tailscale-bulk-join), both by [@thelorax1775](https://github.com/thelorax1775). Licensed under Apache-2.0 — see [LICENSE](LICENSE).
