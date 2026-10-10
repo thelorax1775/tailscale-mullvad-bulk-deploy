@@ -1,3 +1,8 @@
 # Runtime logs written by bulkvpn-deploy.sh
 bulkvpn-*.log
 *.log
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store
