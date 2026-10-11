@@ -4,6 +4,13 @@
 
 ### Changed
 
+- The Tailscale auth key no longer appears on any command line. It used to be
+  embedded in the `tailscale up --authkey=…` string run through `pct exec` /
+  `qm guest exec`, so it was visible in process listings on the host and in
+  the guest. It is now written into the guest as `/run/bulkvpn-ts-authkey`
+  (0600) via `pct push` or `qm guest exec --pass-stdin`, passed as
+  `--auth-key=file:…`, and removed after the join. New `TS_AUTHKEY_FILE`
+  reads the key from a file so it stays out of shell history.
 - `--help` text now lives in a heredoc inside `usage()` instead of the script's
   comment header, so it prints without `#` prefixes and no longer depends on
   fixed line numbers.

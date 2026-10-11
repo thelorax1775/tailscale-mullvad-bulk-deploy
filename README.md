@@ -163,6 +163,7 @@ By default each guest's own LAN subnet is **auto-detected and kept reachable**, 
 | Variable | Default | Purpose |
 |---|---|---|
 | `TS_AUTHKEY` | *(none)* | Tailscale auth key used to enroll guests that have never been on the tailnet. Only needed if such a guest is selected; without it that guest is reported as `FAILED` and nothing in it is changed, while already-enrolled guests deploy normally. |
+| `TS_AUTHKEY_FILE` | *(none)* | Path to a root-only file containing the auth key, read when `TS_AUTHKEY` is unset. Prefer it: a key typed as `TS_AUTHKEY=… ./bulkvpn-deploy.sh` lands in shell history. The key never appears on a command line on the host or in a guest: it is written into the guest as `/run/bulkvpn-ts-authkey` (mode 0600, via `pct push` or `qm guest exec --pass-stdin`), passed as `tailscale up --auth-key=file:…`, and deleted after the join. |
 | `TS_LOGIN_SERVER` | *(none)* | Alternative control server (e.g. Headscale) |
 | `TS_HOSTNAME_PREFIX` | `ct-` (LXC) / `vm-` (VM) | Prefix for each guest's tailnet hostname |
 | `TS_EXTRA_ARGS` | *(none)* | Extra flags appended to every `tailscale up` |
@@ -318,7 +319,7 @@ the interactive menu, or list only the guests you *do* want via `SELECT_GUESTS`
 
 ## Project status
 
-Working tool, last changed in four merged PRs (LAN auto-detect, cross-guest LAN reachability, `FORCE_REDEPLOY`, guest picker). There is no test suite or CI; behaviour described here comes from reading the script and has not been re-verified on a live Proxmox node for this README. Compared with tailscale-bulk-join, this script does not fail fast on a rejected auth key, does not reboot-and-retry a failed join, and installs prerequisites only via apt, dnf or yum (Alpine is skipped anyway as non-systemd), so a plain Tailscale-only rollout is still better served by that repo.
+Working tool, last changed in four merged PRs (LAN auto-detect, cross-guest LAN reachability, `FORCE_REDEPLOY`, guest picker). There is no test suite or CI; behaviour described here comes from reading the script and has not been re-verified on a live Proxmox node for this README. Compared with tailscale-bulk-join, this script does not fail fast on a rejected auth key (it reboots the guest and retries the join once), and installs prerequisites only via apt, dnf or yum (Alpine is skipped anyway as non-systemd), so a plain Tailscale-only rollout is still better served by that repo.
 
 ## Credits & license
 

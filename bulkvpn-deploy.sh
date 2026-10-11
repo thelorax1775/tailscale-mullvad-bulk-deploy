@@ -4,6 +4,8 @@ set -Eeuo pipefail
 
 ### ---- Configuration -------------------------------------------------------
 TS_AUTHKEY="${TS_AUTHKEY:-}"
+TS_AUTHKEY_FILE="${TS_AUTHKEY_FILE:-}"
+TS_AUTHKEY_GUEST_PATH="/run/bulkvpn-ts-authkey"
 TS_LOGIN_SERVER="${TS_LOGIN_SERVER:-}"
 TS_HOSTNAME_PREFIX_LXC="${TS_HOSTNAME_PREFIX:-ct-}"
 TS_HOSTNAME_PREFIX_VM="${TS_HOSTNAME_PREFIX:-vm-}"
@@ -60,6 +62,9 @@ Configuration (environment variables):
   TS_AUTHKEY               Tailscale auth key for enrollment. Only needed when a
                            selected guest has to be enrolled; such a guest
                            FAILS without it, already-enrolled guests don't care
+  TS_AUTHKEY_FILE          path to a root-only file holding the auth key; used
+                           when TS_AUTHKEY is unset, keeps the key out of shell
+                           history
   TS_LOGIN_SERVER          alt control server (e.g. Headscale); default: none
   TS_HOSTNAME_PREFIX       hostname prefix; default: "ct-" (LXC) / "vm-" (VM)
   TS_EXTRA_ARGS            extra flags appended to every `tailscale up`
@@ -414,7 +419,7 @@ sanitize_hostname() { printf '%s' "$1" | tr -c 'a-zA-Z0-9-' '-' | sed 's/-\+/-/g
 
 build_up_cmd() {   # $1 hostname -> echoes the in-guest `tailscale up ...` command
     local host="$1" cmd
-    cmd="tailscale up --authkey='${TS_AUTHKEY}' --hostname='${host}'"
+    cmd="tailscale up --auth-key='file:${TS_AUTHKEY_GUEST_PATH}' --hostname='${host}'"
     [[ -n "$TS_LOGIN_SERVER" ]] && cmd+=" --login-server='${TS_LOGIN_SERVER}'"
     [[ -n "$TS_EXTRA_ARGS"   ]] && cmd+=" ${TS_EXTRA_ARGS}"
     # If an exit node is used at enrollment (e.g. pinned via TS_EXTRA_ARGS),
@@ -437,6 +442,29 @@ vm_guest_exec() {
     [[ -n "$out" ]] && printf '%s' "$out"
     [[ -n "$rc" ]] || rc=91
     return "$rc"
+}
+
+push_authkey() {
+    local engine="$1" id="$2" tmp rc
+    case "$engine" in
+        lxc)
+            tmp="$(umask 077; mktemp)" || return 1
+            printf '%s' "$TS_AUTHKEY" > "$tmp"
+            pct push "$id" "$tmp" "$TS_AUTHKEY_GUEST_PATH" --perms 0600
+            rc=$?
+            rm -f "$tmp"
+            return "$rc"
+            ;;
+        vm)
+            printf '%s' "$TS_AUTHKEY" \
+                | qm guest exec "$id" --timeout "$VM_EXEC_TIMEOUT" --pass-stdin 1 -- \
+                    sh -c "umask 077; cat > '$TS_AUTHKEY_GUEST_PATH'" >/dev/null 2>&1
+            ;;
+    esac
+}
+
+remove_authkey() {
+    run_guest "$1" "$2" "rm -f '$TS_AUTHKEY_GUEST_PATH'" >/dev/null 2>&1 || true
 }
 
 run_guest() {   # engine id cmd
@@ -587,12 +615,15 @@ enroll_guest() {
     fi
 
     log "  [$label] enrolling into tailnet as '$host'"
+    push_authkey "$engine" "$id" || { log "  [$label] FAILED to place the auth key in the guest"; return 1; }
     if ! run_guest "$engine" "$id" "$(build_up_cmd "$host")"; then
         log "  [$label] join failed — rebooting and retrying once"
         guest_reboot "$engine" "$id" || true
+        push_authkey "$engine" "$id" || { log "  [$label] FAILED to place the auth key in the guest"; return 1; }
         run_guest "$engine" "$id" "$(build_up_cmd "$host")" \
-            || { log "  [$label] FAILED to join tailnet"; return 1; }
+            || { remove_authkey "$engine" "$id"; log "  [$label] FAILED to join tailnet"; return 1; }
     fi
+    remove_authkey "$engine" "$id"
     return 0
 }
 
@@ -899,6 +930,10 @@ main() {
     [[ "$MULLVAD_LAN_INCLUDE_GUESTS" == "1" ]] && lanmode+=" +all-guests"
     log "Node: $PVE_NODE   LAN: $lanmode   Country: ${MULLVAD_COUNTRY_FILTER:-any}   Dry-run: $DRY   Force-redeploy: $FORCE"
     log "Selected guests: $SELECTED_IDS"
+    if [[ -z "$TS_AUTHKEY" && -n "$TS_AUTHKEY_FILE" ]]; then
+        [[ -r "$TS_AUTHKEY_FILE" ]] || die "TS_AUTHKEY_FILE is set but not readable: $TS_AUTHKEY_FILE"
+        TS_AUTHKEY="$(tr -d '\r\n' < "$TS_AUTHKEY_FILE")"
+    fi
     [[ -n "$TS_AUTHKEY" ]] || log "TS_AUTHKEY not set — fine if every selected guest is already on the tailnet; a guest that needs enrollment will fail"
     log "Log:  $LOG_FILE"
     log "----------------------------------------------------------------------"
