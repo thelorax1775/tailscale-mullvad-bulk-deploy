@@ -10,6 +10,15 @@
 
 ### Fixed
 
+- `DRY_RUN=1` now reports what a real run would actually do. It used to print
+  `WOULD deploy` right after the systemd check, before looking at Tailscale or
+  Mullvad, so on one node 17 guests that a real run skips (no Mullvad exit node
+  visible) were reported as `WOULD deploy`. The dry run now runs the same
+  read-only checks as a real run (guest agent, existing kill-switch, systemd,
+  Tailscale state, Mullvad exit nodes) and reports `WOULD deploy` (with the LAN
+  set it would use), `WOULD enroll`, `WOULD skip: <reason>` or `WOULD fail`,
+  with a matching tally.
+
 - Host `tun` check no longer misses a `tun` that is built into the kernel.
   `lsmod | grep ^tun` only sees loadable modules, so on kernels with built-in
   tun the script ran `modprobe` and checked `tun.conf` on every run. It now

@@ -65,8 +65,8 @@ TS_AUTHKEY=tskey-auth-xxxxxxdeploy ./bulkvpn-deploy.sh
 # any guest that would need enrollment is reported as FAILED and left alone
 ./bulkvpn-deploy.sh
 
-# see what it would do, change nothing
-DRY_RUN=1 TS_AUTHKEY=tskey-... ./bulkvpn-deploy.sh
+# see what it would do, change nothing (see "Dry run" below)
+DRY_RUN=1 SELECT_GUESTS="101 102 205" ./bulkvpn-deploy.sh
 
 # pick which guests to deploy to: on a terminal you get an interactive
 # checklist (whiptail) of the running containers/VMs; toggle with Space, Enter
@@ -120,6 +120,28 @@ logged and ignored, so a router VM's WAN bridge can't punch a hole in every
 guest's firewall. Use `MULLVAD_LAN_SCAN_EXCLUDE` to leave specific guests (a
 router VM, say) out of the pre-scan entirely.
 
+### Dry run
+
+`DRY_RUN=1` walks the selected guests through the same checks a real run makes,
+in the same order, and stops short of every change. Per guest it reports the
+outcome a real run would have:
+
+| Dry-run line | Meaning |
+|---|---|
+| `WOULD deploy — LAN kept reachable: { … }` | Tailscale is `Running` and a Mullvad exit node is visible; a real run deploys with this LAN set |
+| `WOULD enroll — …` | The guest has never been on a tailnet; a real run would enroll it (listing any `/dev/net/tun` + CT reboot and Tailscale install it needs), then deploy only if a Mullvad exit node becomes visible |
+| `WOULD skip — <reason>` | A real run would skip it: no guest agent, already protected, not systemd, existing Tailscale state that isn't `Running`, or no Mullvad exit node visible |
+| `WOULD fail — … TS_AUTHKEY is not set` | The guest needs enrollment and no auth key was given |
+
+The checks run inside the selected guests are read-only: test for the
+kill-switch files/units, `test -d /run/systemd/system`, the Tailscale probe
+(`tailscale status --json`, the state file, `systemctl is-active tailscaled`),
+`tailscale exit-node list`, and `ip route` for the LAN set. On the host it reads
+config only; it does not load the `tun` module, edit CT configs, reboot, install
+or push anything. The one thing it writes is its own log in
+`/root/bulkvpn-<timestamp>.log`. The final tally is `WOULD_DEPLOY / WOULD_ENROLL
+/ WOULD_FAIL / SKIPPED / FAILED`.
+
 ### Re-running on the same node
 
 Re-runs are **idempotent**: by default a guest that's already protected (rotate
@@ -152,7 +174,7 @@ By default each guest's own LAN subnet is **auto-detected and kept reachable**, 
 | `MULLVAD_COUNTRY_FILTER` | *(any)* | Restrict exit-node rotation to a country (e.g. `USA`) |
 | `PVE_NODE` | `hostname -s` | Proxmox node to scan |
 | `SELECT_GUESTS` | *(unset)* | Space/comma-separated vmids to deploy to. Unset + a terminal → an interactive checklist to pick running guests; unset + no terminal (cron/pipe) → every running guest (the historical default). |
-| `DRY_RUN` | `0` | `1` = enumerate & classify only, deploy nothing |
+| `DRY_RUN` | `0` | `1` = change nothing; run the same read-only checks as a real run and report `WOULD deploy` / `WOULD enroll` / `WOULD skip` / `WOULD fail` per guest (see [Dry run](#dry-run)) |
 | `FORCE_REDEPLOY` | `0` | `1` = re-push assets and reload the ruleset on **already-protected** guests too (use to roll out config/asset changes to guests deployed by an earlier run) |
 
 Every run writes a timestamped log to `/root/bulkvpn-<timestamp>.log` and prints a `SUCCESS / SKIPPED / FAILED` tally.

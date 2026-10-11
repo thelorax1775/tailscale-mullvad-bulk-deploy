@@ -26,6 +26,7 @@ LOG_FILE="/root/bulkvpn-$(date '+%Y%m%d-%H%M%S').log"
 ### --------------------------------------------------------------------------
 
 SUCCESS=0; SKIPPED=0; FAILED=0
+WOULD_DEPLOY=0; WOULD_ENROLL=0; WOULD_FAIL=0
 SELECTED_IDS=""                         # space-separated vmids chosen for deploy
 
 usage() {
@@ -84,7 +85,11 @@ Configuration (environment variables):
                            prompt fallback) lets you pick which running guests
                            get the kill-switch. When unset with no terminal
                            (cron/pipe), every running guest is selected.
-  DRY_RUN                  1 = enumerate & classify only, change nothing
+  DRY_RUN                  1 = change nothing; run the same read-only checks a
+                           real run does (guest agent, existing kill-switch,
+                           systemd, Tailscale state, Mullvad exit nodes) and
+                           report WOULD deploy / WOULD enroll / WOULD skip /
+                           WOULD fail per guest
   FORCE_REDEPLOY           1 = re-push assets to every guest even if already
                            protected (use to roll out config/asset changes)
 
@@ -461,6 +466,12 @@ wait_for_lxc_ready() {
     return 1
 }
 
+lxc_tun_configured() {
+    local conf="/etc/pve/lxc/${1}.conf"
+    grep -q '^lxc.cgroup2.devices.allow: c 10:200 rwm' "$conf" 2>/dev/null \
+        && grep -q '^lxc.mount.entry: /dev/net/tun' "$conf" 2>/dev/null
+}
+
 enable_tun_lxc() {   # returns 0 = no change, 1 = changed (reboot needed)
     local vmid="$1" changed=0
     local conf="/etc/pve/lxc/${vmid}.conf"
@@ -530,8 +541,10 @@ ts_classify() {
 
     if [[ "$backend" == "Running" ]]; then
         printf 'ready|'
+    elif [[ "$profile" == "1" && "$backend" == "unknown" ]]; then
+        printf 'keep|Tailscale has a login profile but its status could not be read after retries (tailscaled: %s)' "$svc"
     elif [[ "$profile" == "1" ]]; then
-        printf 'keep|Tailscale already has a login profile but its backend is %s (tailscaled: %s)' "$backend" "$svc"
+        printf 'keep|Tailscale has a login profile but its backend is %s (tailscaled: %s)' "$backend" "$svc"
     elif [[ "$bin" == "0" && "$state" == "1" ]]; then
         printf 'keep|/var/lib/tailscale holds state but the tailscale binary is missing'
     elif [[ "$bin" == "0" ]]; then
@@ -583,6 +596,30 @@ enroll_guest() {   # engine id label hostname install|enroll
     return 0
 }
 
+skip_guest() {   # label reason
+    if $DRY; then
+        log "  [$1] WOULD skip — $2"
+    else
+        log "  [$1] SKIP — $2"
+    fi
+    inc SKIPPED
+}
+
+dry_enroll_report() {   # engine id label hostname install|enroll
+    local engine="$1" id="$2" label="$3" host="$4" action="$5" steps=""
+    if [[ -z "$TS_AUTHKEY" ]]; then
+        log "  [$label] WOULD fail — guest needs Tailscale enrollment but TS_AUTHKEY is not set"
+        inc WOULD_FAIL
+        return 0
+    fi
+    if [[ "$engine" == "lxc" && "$action" == "install" ]] && ! lxc_tun_configured "$id"; then
+        steps+="add /dev/net/tun to the CT config and reboot the CT, "
+    fi
+    [[ "$action" == "install" ]] && steps+="install Tailscale, "
+    log "  [$label] WOULD enroll — ${steps}join the tailnet as '$host', then deploy if a Mullvad exit node becomes visible (dry run)"
+    inc WOULD_ENROLL
+}
+
 process_guest() {   # engine id name
     local engine="$1" vmid="$2" name="$3" kind label host probe verdict action reason
     if [[ "$engine" == "lxc" ]]; then
@@ -595,19 +632,20 @@ process_guest() {   # engine id name
     log "$kind $label"
 
     if [[ "$engine" == "vm" ]] && ! wait_for_vm_agent "$vmid"; then
-        log "  [$label] SKIP — qemu-guest-agent not responding (install & start it in the guest)"; inc SKIPPED; return 0
+        skip_guest "$label" "qemu-guest-agent not responding (install & start it in the guest)"; return 0
     fi
     if run_guest "$engine" "$vmid" "$CMD_PROTECTED"; then
         if ! $FORCE; then
-            log "  [$label] SKIP — kill-switch already installed & scheduled (set FORCE_REDEPLOY=1 to re-push)"; inc SKIPPED; return 0
+            skip_guest "$label" "kill-switch already installed & scheduled (set FORCE_REDEPLOY=1 to re-push)"; return 0
         fi
-        log "  [$label] FORCE_REDEPLOY — re-pushing assets to already-protected guest"
+        if $DRY; then
+            log "  [$label] FORCE_REDEPLOY — already protected; checking whether a re-push would go ahead"
+        else
+            log "  [$label] FORCE_REDEPLOY — re-pushing assets to already-protected guest"
+        fi
     fi
     if ! run_guest "$engine" "$vmid" "$CMD_HAS_SYSTEMD"; then
-        log "  [$label] SKIP — guest is not systemd-based"; inc SKIPPED; return 0
-    fi
-    if $DRY; then
-        log "  [$label] WOULD deploy (dry run)"; inc SKIPPED; return 0
+        skip_guest "$label" "guest is not systemd-based"; return 0
     fi
 
     probe="$(run_guest "$engine" "$vmid" "$CMD_TS_PROBE" 2>/dev/null | tr -d '\r')" || true
@@ -617,14 +655,23 @@ process_guest() {   # engine id name
         ready)
             log "  [$label] Tailscale already active" ;;
         install|enroll)
+            if $DRY; then
+                dry_enroll_report "$engine" "$vmid" "$label" "$host" "$action"; return 0
+            fi
             enroll_guest "$engine" "$vmid" "$label" "$host" "$action" || { inc FAILED; return 0; } ;;
         *)
-            log "  [$label] SKIP — WARN: ${reason}. Not rebooting or re-enrolling a guest that may already be on the tailnet; fix Tailscale in the guest and re-run."
-            inc SKIPPED; return 0 ;;
+            skip_guest "$label" "WARN: ${reason}. Not rebooting or re-enrolling a guest that may already be on the tailnet; fix Tailscale in the guest and re-run."
+            return 0 ;;
     esac
 
     if ! run_guest "$engine" "$vmid" "$CMD_MULLVAD_AVAIL"; then
-        log "  [$label] SKIP — no Mullvad exit node visible on tailnet (nothing to protect with)"; inc SKIPPED; return 0
+        skip_guest "$label" "no Mullvad exit node visible on tailnet (nothing to protect with)"; return 0
+    fi
+
+    if $DRY; then
+        log "  [$label] WOULD deploy — LAN kept reachable: $(lan_nft_set "$(resolve_lan_list "$engine" "$vmid")") (dry run)"
+        inc WOULD_DEPLOY
+        return 0
     fi
 
     if deploy_killswitch "$engine" "$vmid" "$label"; then
@@ -879,7 +926,11 @@ main() {
     done < <(list_guests qemu)
 
     log "----------------------------------------------------------------------"
-    log "Done.  SUCCESS=$SUCCESS  SKIPPED=$SKIPPED  FAILED=$FAILED"
+    if $DRY; then
+        log "Done (dry run, nothing changed).  WOULD_DEPLOY=$WOULD_DEPLOY  WOULD_ENROLL=$WOULD_ENROLL  WOULD_FAIL=$WOULD_FAIL  SKIPPED=$SKIPPED  FAILED=$FAILED"
+    else
+        log "Done.  SUCCESS=$SUCCESS  SKIPPED=$SKIPPED  FAILED=$FAILED"
+    fi
     log "Full log: $LOG_FILE"
     (( FAILED == 0 ))
 }
