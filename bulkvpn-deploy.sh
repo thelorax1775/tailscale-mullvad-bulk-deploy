@@ -11,6 +11,8 @@ TS_EXTRA_ARGS="${TS_EXTRA_ARGS:-}"
 MULLVAD_LAN_AUTODETECT="${MULLVAD_LAN_AUTODETECT:-1}"   # 1 = auto-allow each guest's own LAN
 MULLVAD_LAN_INCLUDE_GUESTS="${MULLVAD_LAN_INCLUDE_GUESTS:-1}"  # 1 = also allow every other running guest's LAN subnet(s)
 MULLVAD_LAN_SUBNET="${MULLVAD_LAN_SUBNET:-}"            # extra subnet(s) to always allow (space/comma sep)
+MULLVAD_LAN_SCAN_EXCLUDE="${MULLVAD_LAN_SCAN_EXCLUDE:-}"
+MULLVAD_LAN_AGENT_QUERY="${MULLVAD_LAN_AGENT_QUERY:-1}"
 MULLVAD_COUNTRY_FILTER="${MULLVAD_COUNTRY_FILTER:-}"
 PVE_NODE="${PVE_NODE:-$(hostname -s)}"
 SELECT_GUESTS="${SELECT_GUESTS:-}"      # space/comma vmids to deploy to; empty = menu (TTY) or all (no TTY)
@@ -58,7 +60,16 @@ Configuration (environment variables):
   MULLVAD_LAN_AUTODETECT   1 (default) = auto-allow each guest's own LAN subnet(s)
   MULLVAD_LAN_INCLUDE_GUESTS 1 (default) = also allow every other running
                            guest's LAN subnet(s) on the node, so containers,
-                           VMs, and LXCs stay reachable to each other on the LAN
+                           VMs, and LXCs stay reachable to each other on the LAN.
+                           The subnets come from the host side only (pct/qm
+                           config ip= / ipconfigN, else the host's subnet on the
+                           guest's bridge/VLAN); no guest is entered for this,
+                           and only private (RFC1918) subnets are used
+  MULLVAD_LAN_SCAN_EXCLUDE space/comma vmids left out of that cross-guest scan
+                           (e.g. a router VM whose WAN bridge isn't LAN)
+  MULLVAD_LAN_AGENT_QUERY  1 (default) = for SELECTED VMs only, also ask the QEMU
+                           guest agent for its addresses (network-get-interfaces,
+                           read-only); 0 = host-side config only
   MULLVAD_LAN_SUBNET       extra subnet(s) to always allow (space/comma sep); default: none
   MULLVAD_COUNTRY_FILTER   limit rotation to a country (e.g. "USA"); default: any
   PVE_NODE                 Proxmox node to scan; default: `hostname -s`
@@ -694,29 +705,111 @@ select_guests() {
 }
 
 ### ---- Cross-guest LAN discovery -------------------------------------------
-# collect_guest_lans: sweep every RUNNING guest once up-front and union their
-# directly-connected LAN subnet(s) into GUEST_LAN_SET, so resolve_lan() can keep
-# each guest reachable to all the other containers/VMs/LXCs on the LAN — not
-# just to its own subnet. Read-only (`ip route`), so it is safe in DRY_RUN too.
+cidr_network() {
+    local a b c d len n m
+    [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]] || return 1
+    a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]}))
+    c=$((10#${BASH_REMATCH[3]})); d=$((10#${BASH_REMATCH[4]}))
+    len=$((10#${BASH_REMATCH[5]}))
+    (( a < 256 && b < 256 && c < 256 && d < 256 && len <= 32 )) || return 1
+    n=$(( (a << 24) | (b << 16) | (c << 8) | d ))
+    m=$(( len == 0 ? 0 : (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+    n=$(( n & m ))
+    printf '%d.%d.%d.%d/%d\n' $(( (n >> 24) & 255 )) $(( (n >> 16) & 255 )) $(( (n >> 8) & 255 )) $(( n & 255 )) "$len"
+}
+
+lan_cidr_filter() {
+    grep -E '^[0-9.]+/[0-9]+$' | grep -vE '^(127|169\.254|100)\.' | sort -u || true
+}
+
+private_cidr_filter() {
+    awk -F'[./]' '
+        NF == 5 && (($1 == 10 && $5 >= 8) ||
+                    ($1 == 172 && $2 >= 16 && $2 <= 31 && $5 >= 12) ||
+                    ($1 == 192 && $2 == 168 && $5 >= 16)) { print }'
+}
+
+host_bridge_subnets() {
+    local dev="$1"
+    [[ -n "$dev" ]] || return 0
+    [[ -n "${2:-}" ]] && dev="${1}.${2}"
+    { ip -4 -o route show dev "$dev" scope link 2>/dev/null || true; } | awk '{ print $1 }'
+}
+
+pve_net_subnets() {
+    local cfg="$1" line idx kv bridge tag ip
+    local -a kvs=()
+    local -A net_bridge=() net_tag=() net_ip=()
+    while IFS= read -r line; do
+        [[ "$line" =~ ^(net|ipconfig)([0-9]+):\ (.*)$ ]] || continue
+        idx="${BASH_REMATCH[2]}"
+        IFS=, read -ra kvs <<<"${BASH_REMATCH[3]}"
+        for kv in "${kvs[@]}"; do
+            case "$kv" in
+                bridge=*) net_bridge[$idx]="${kv#bridge=}" ;;
+                tag=*)    net_tag[$idx]="${kv#tag=}" ;;
+                ip=*)     net_ip[$idx]="${kv#ip=}" ;;
+            esac
+        done
+    done <<<"$cfg"
+    for idx in "${!net_bridge[@]}"; do
+        bridge="${net_bridge[$idx]}"; tag="${net_tag[$idx]:-}"; ip="${net_ip[$idx]:-}"
+        if [[ "$ip" == */* ]]; then
+            cidr_network "$ip" || true
+        else
+            host_bridge_subnets "$bridge" "$tag"
+        fi
+    done
+    return 0
+}
+
+vm_agent_subnets() {
+    local cidr
+    qm guest cmd "$1" network-get-interfaces 2>/dev/null \
+        | jq -r '.[]? | select((.name // "") | test("^(lo$|tailscale|docker|br-|veth|cni|podman)") | not)
+                 | ."ip-addresses"[]? | select(."ip-address-type" == "ipv4")
+                 | "\(."ip-address")/\(.prefix)"' 2>/dev/null \
+        | while IFS= read -r cidr; do cidr_network "$cidr" || true; done
+}
+
+is_scan_excluded() {
+    [[ " $(printf '%s' "$MULLVAD_LAN_SCAN_EXCLUDE" | tr ',' ' ') " == *" $1 "* ]]
+}
+
 collect_guest_lans() {
     [[ "$MULLVAD_LAN_INCLUDE_GUESTS" == "1" ]] || return 0
-    local vmid status name detected subs=""
+    local vmid status name found kept dropped subs="" eng elabel
 
-    log "Pre-scan: collecting LAN subnets across all running guests ..."
-    while IFS=$'\t' read -r vmid status name; do
-        [[ "$status" == "running" ]] || continue
-        detected="$(run_guest lxc "$vmid" "$CMD_DETECT_LAN" 2>/dev/null | tr -d '\r')" || true
-        [[ -n "$detected" ]] && subs+=" $detected"
-    done < <(list_guests lxc)
+    log "Pre-scan: collecting LAN subnets from host-side guest config (no guest is entered) ..."
+    for eng in lxc qemu; do
+        [[ "$eng" == "lxc" ]] && elabel="ct" || elabel="vm"
+        while IFS=$'\t' read -r vmid status name; do
+            [[ "$status" == "running" ]] || continue
+            if is_scan_excluded "$vmid"; then
+                log "Pre-scan: ${elabel}/${vmid} (${name}) excluded by MULLVAD_LAN_SCAN_EXCLUDE"
+                continue
+            fi
+            if [[ "$eng" == "lxc" ]]; then
+                found="$(pve_net_subnets "$(pct config "$vmid" 2>/dev/null)" | lan_cidr_filter)"
+            else
+                found="$(pve_net_subnets "$(qm config "$vmid" 2>/dev/null)" | lan_cidr_filter)"
+                if [[ "$MULLVAD_LAN_AGENT_QUERY" == "1" ]] && is_selected "$vmid" && vm_agent_ready "$vmid"; then
+                    found="$(printf '%s\n%s\n' "$found" "$(vm_agent_subnets "$vmid")" | lan_cidr_filter)"
+                fi
+            fi
+            kept="$(printf '%s\n' "$found" | private_cidr_filter | paste -sd' ' -)"
+            dropped="$(printf '%s\n' "$found" | { grep -vxF -f <(printf '%s\n' "$kept" | tr ' ' '\n') || true; } | paste -sd' ' -)"
+            [[ -n "$dropped" ]] && log "Pre-scan: ${elabel}/${vmid} (${name}) ignoring non-private subnet(s): ${dropped} (add them with MULLVAD_LAN_SUBNET if they really are LAN)"
+            if [[ -n "$kept" ]]; then
+                log "Pre-scan: ${elabel}/${vmid} (${name}) -> ${kept}"
+                subs+=" ${kept}"
+            elif [[ -z "$found" ]]; then
+                log "Pre-scan: ${elabel}/${vmid} (${name}) -> nothing derivable"
+            fi
+        done < <(list_guests "$eng")
+    done
 
-    while IFS=$'\t' read -r vmid status name; do
-        [[ "$status" == "running" ]] || continue
-        vm_agent_ready "$vmid" || continue   # unreachable VMs are simply not counted
-        detected="$(run_guest vm "$vmid" "$CMD_DETECT_LAN" 2>/dev/null | tr -d '\r')" || true
-        [[ -n "$detected" ]] && subs+=" $detected"
-    done < <(list_guests qemu)
-
-    GUEST_LAN_SET="$(printf '%s' "$subs" | tr ' ' '\n' | grep -E '/[0-9]+$' | sort -u | tr '\n' ' ')"
+    GUEST_LAN_SET="$(printf '%s' "$subs" | tr ' ' '\n' | lan_cidr_filter | tr '\n' ' ')"
     if [[ -n "$GUEST_LAN_SET" ]]; then
         log "Pre-scan: guest LAN subnets kept reachable everywhere: ${GUEST_LAN_SET}"
     else

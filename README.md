@@ -23,7 +23,8 @@ It combines two upstream projects by [@thelorax1775](https://github.com/thelorax
 
 ```
 enumerate running LXC + VMs on the node
-  pre-scan: union every running guest's own LAN subnet(s)   [all-guests reachability]
+  pre-scan: union every running guest's LAN subnet(s)       [all-guests reachability]
+            from host-side config only; unselected guests are never entered
   └─ for each guest:
        already protected?          → SKIP
        not systemd-based?          → SKIP (warn)  [kill-switch ships as systemd units]
@@ -96,9 +97,20 @@ To pick a subset:
   `SELECT_GUESTS` is unset **and** there's no terminal (cron, a pipe), it deploys
   to every running guest, exactly as before.
 
-The selection only controls *which guests get the kill-switch installed* — the
-cross-guest LAN pre-scan still sweeps every running guest, so a protected guest
-stays reachable to all the others on the LAN, selected or not.
+The selection controls *which guests are touched at all*. Only selected guests
+are ever entered (`pct exec`, `qm guest exec`) or queried through the QEMU guest
+agent. The cross-guest LAN pre-scan still covers every running guest so a
+protected guest stays reachable to all the others, selected or not, but for
+unselected guests it reads only host-side state: the guest's Proxmox config
+(`pct config` / `qm config`: the `ip=` of each `netN` line, or a VM's cloud-init
+`ipconfigN`) and, when no static address is configured, the host's own subnet on
+the bridge (or `bridge.tag` VLAN interface) the NIC is attached to. For selected
+VMs it also asks the guest agent for its addresses (`qm guest cmd <vmid>
+network-get-interfaces`, read-only; `MULLVAD_LAN_AGENT_QUERY=0` turns that off).
+Only private (RFC1918) subnets are taken from the pre-scan; anything else is
+logged and ignored, so a router VM's WAN bridge can't punch a hole in every
+guest's firewall. Use `MULLVAD_LAN_SCAN_EXCLUDE` to leave specific guests (a
+router VM, say) out of the pre-scan entirely.
 
 ### Re-running on the same node
 
@@ -125,7 +137,9 @@ By default each guest's own LAN subnet is **auto-detected and kept reachable**, 
 | `TS_HOSTNAME_PREFIX` | `ct-` (LXC) / `vm-` (VM) | Prefix for each guest's tailnet hostname |
 | `TS_EXTRA_ARGS` | *(none)* | Extra flags appended to every `tailscale up` |
 | `MULLVAD_LAN_AUTODETECT` | `1` | Auto-detect and allow each guest's own LAN subnet(s). `0` = don't. |
-| `MULLVAD_LAN_INCLUDE_GUESTS` | `1` | Also allow every other running guest's LAN subnet(s) on the node, so containers, VMs, and LXCs stay reachable to each other on the LAN. `0` = each guest's own subnet only. |
+| `MULLVAD_LAN_INCLUDE_GUESTS` | `1` | Also allow every other running guest's LAN subnet(s) on the node, so containers, VMs, and LXCs stay reachable to each other on the LAN. Derived from host-side config without entering any guest; private (RFC1918) subnets only. `0` = each guest's own subnet only. |
+| `MULLVAD_LAN_SCAN_EXCLUDE` | *(none)* | Space/comma-separated vmids to leave out of the cross-guest LAN pre-scan (e.g. a router VM) |
+| `MULLVAD_LAN_AGENT_QUERY` | `1` | `1` = in the pre-scan, also ask the QEMU guest agent of **selected** VMs for their addresses (read-only `network-get-interfaces`). `0` = host-side config only. Unselected VMs are never queried either way. |
 | `MULLVAD_LAN_SUBNET` | *(none)* | Extra subnet(s) to always allow, on top of auto-detect (space/comma separated) |
 | `MULLVAD_COUNTRY_FILTER` | *(any)* | Restrict exit-node rotation to a country (e.g. `USA`) |
 | `PVE_NODE` | `hostname -s` | Proxmox node to scan |
@@ -144,13 +158,13 @@ Every run writes a timestamped log to `/root/bulkvpn-<timestamp>.log` and prints
 
 ## Caveats
 
-- **LAN access is automatic.** Each guest's own directly-connected LAN subnet(s) are auto-detected (from its link routes, excluding loopback / link-local / the Tailscale CGNAT range) and allowed by the firewall, so SSH / web UIs stay reachable without configuration. In addition, a one-time pre-scan unions the LAN subnet(s) of *every* running container / VM / LXC on the node and allows that whole set on every guest, so guests stay reachable to each other on the same LAN subnet(s) they were on before — set `MULLVAD_LAN_INCLUDE_GUESTS=0` to allow only each guest's own subnet. If nothing is detectable the firewall falls back to the private RFC1918 ranges (never locks you out). Set `MULLVAD_LAN_SUBNET` to add extra subnets (e.g. a separate management VLAN), or `MULLVAD_LAN_AUTODETECT=0` to allow *only* what you list. On the Tailscale side, `--exit-node-allow-lan-access=true` is set automatically whenever an exit node is in use — the rotate script sets it on every node switch, and enrollment adds it too if you pin an exit node via `TS_EXTRA_ARGS` — so routing traffic through an exit node never blackholes direct access to your local network. Because `--exit-node-allow-lan-access` only exempts each guest's *own* directly-connected subnet, the rotate script additionally installs a high-priority `ip rule` (`to <subnet> lookup main`, priority 5200 — above Tailscale's diverter) for every allowed subnet, so traffic to *other* LAN subnets reached via the gateway egresses directly instead of being swallowed into the tunnel. That's what lets containers/VMs/LXCs on different subnets keep pinging each other once the kill-switch is active; the rules are runtime-only and re-asserted on every self-heal run (2 min after boot, then every 15 min).
+- **LAN access is automatic.** Each guest's own directly-connected LAN subnet(s) are auto-detected (from its link routes, excluding loopback / link-local / the Tailscale CGNAT range) and allowed by the firewall, so SSH / web UIs stay reachable without configuration. In addition, a one-time pre-scan unions the LAN subnet(s) of *every* running container / VM / LXC on the node (read from host-side config, without entering unselected guests — see [Choosing which guests get the kill-switch](#choosing-which-guests-get-the-kill-switch)) and allows that whole set on every guest, so guests stay reachable to each other on the same LAN subnet(s) they were on before — set `MULLVAD_LAN_INCLUDE_GUESTS=0` to allow only each guest's own subnet. If nothing is detectable the firewall falls back to the private RFC1918 ranges (never locks you out). Set `MULLVAD_LAN_SUBNET` to add extra subnets (e.g. a separate management VLAN), or `MULLVAD_LAN_AUTODETECT=0` to allow *only* what you list. On the Tailscale side, `--exit-node-allow-lan-access=true` is set automatically whenever an exit node is in use — the rotate script sets it on every node switch, and enrollment adds it too if you pin an exit node via `TS_EXTRA_ARGS` — so routing traffic through an exit node never blackholes direct access to your local network. Because `--exit-node-allow-lan-access` only exempts each guest's *own* directly-connected subnet, the rotate script additionally installs a high-priority `ip rule` (`to <subnet> lookup main`, priority 5200 — above Tailscale's diverter) for every allowed subnet, so traffic to *other* LAN subnets reached via the gateway egresses directly instead of being swallowed into the tunnel. That's what lets containers/VMs/LXCs on different subnets keep pinging each other once the kill-switch is active; the rules are runtime-only and re-asserted on every self-heal run (2 min after boot, then every 15 min).
 - **Fail-closed ordering is enforced.** Tailscale + a visible Mullvad exit node are verified *before* the drop-policy firewall is loaded. A guest with no Mullvad exit node visible on the tailnet is **skipped** and left untouched rather than cut off — the kill-switch is only ever deployed where there's an endpoint to protect with.
 - **nftables in LXC:** privileged containers work cleanly; unprivileged containers run the firewall in their own netns and usually work, but `/dev/net/tun` passthrough for Tailscale is more reliable in a privileged CT (a warning is logged).
 - **Forwarding is fail-closed too.** A guest that forwards traffic for other machines — a Linux NAT gateway, or a Tailscale subnet router or exit node advertising anything beyond the allowed LAN subnets — will have that forwarded traffic dropped unless it goes out `tailscale0` or to an allowed LAN subnet. Container bridges with names outside `docker*` / `br-*` / `podman*` / `cni*` (LXD, Incus, libvirt `virbr0`) are not on the allowlist, so traffic into them is allowed only when their subnet is in the LAN set. Re-deploying to a guest that is already protected needs `FORCE_REDEPLOY=1` to pick up the forward chain.
 - **systemd only.** The kill-switch ships as systemd units; non-systemd guests (Alpine/OpenRC, etc.) are detected and skipped.
 - **VMs need qemu-guest-agent** installed and running, or they're skipped with a note.
-- **The Proxmox host itself is never modified** (beyond loading the `tun` kernel module for LXC passthrough) — only guests are touched. The module is loaded and persisted in `/etc/modules-load.d/tun.conf` only when it is neither built into the running kernel (`modules.builtin`) nor already loaded (`/sys/module/tun`); a dry run only reports that it would do so.
+- **The Proxmox host itself is never modified** (beyond loading the `tun` kernel module for LXC passthrough, and appending the `/dev/net/tun` passthrough lines to `/etc/pve/lxc/<ctid>.conf` of a selected CT that has to be enrolled) — only selected guests are touched. The module is loaded and persisted in `/etc/modules-load.d/tun.conf` only when it is neither built into the running kernel (`modules.builtin`) nor already loaded (`/sys/module/tun`); a dry run only reports that it would do so.
 
 ## Repository layout
 
