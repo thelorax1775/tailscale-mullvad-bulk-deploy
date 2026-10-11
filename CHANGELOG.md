@@ -16,3 +16,12 @@
   checks `modules.builtin` and `/sys/module/tun` and only loads and persists
   the module when it is actually missing. A dry run no longer loads the module
   or writes `tun.conf`; it reports what it would do.
+- Forwarded traffic is now fail-closed. The nftables kill-switch only had an
+  `output` chain, so traffic a guest forwarded (Docker containers on a bridge
+  network) bypassed it and could leave through the physical NIC when the exit
+  node was down. A `forward` chain with a `drop` policy now allows only
+  established/related flows, egress via `tailscale0`, the allowed LAN subnets,
+  and traffic into local container bridges (`docker*`, `br-*`, `podman*`,
+  `cni*`). The `output` chain is unchanged. Already-protected guests need
+  `FORCE_REDEPLOY=1` to receive it. The upstream
+  `tailscale-mullvad-killswitch` ruleset needs the same change.

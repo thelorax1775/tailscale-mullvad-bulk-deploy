@@ -233,6 +233,21 @@ table inet mullvad_killswitch {
 
         udp dport 67 accept
     }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+
+        ct state established,related accept
+
+        oifname "tailscale0" accept
+
+        ip daddr $LAN accept
+
+        oifname "docker*" accept
+        oifname "br-*" accept
+        oifname "podman*" accept
+        oifname "cni*" accept
+    }
 }
 NFT_EOF
 }
