@@ -349,6 +349,31 @@ require_host_tools() {
     [[ -n "$TS_AUTHKEY" ]] || die "TS_AUTHKEY is required (Tailscale auth key)"
 }
 
+host_tun_builtin() {
+    grep -qE '(^|/)tun\.ko' "/lib/modules/$(uname -r)/modules.builtin" 2>/dev/null
+}
+
+host_tun_loaded() { [[ -d /sys/module/tun ]]; }
+
+ensure_host_tun() {
+    if host_tun_builtin; then
+        log "Host: tun is built into the kernel — nothing to load"
+        return 0
+    fi
+    if host_tun_loaded; then
+        log "Host: tun module already loaded"
+        return 0
+    fi
+    if $DRY; then
+        log "Host: WOULD modprobe tun and add it to /etc/modules-load.d/tun.conf (dry run)"
+        return 0
+    fi
+    modprobe tun 2>/dev/null || log "WARN: could not modprobe tun on host"
+    grep -qxF tun /etc/modules-load.d/tun.conf 2>/dev/null \
+        || echo tun >> /etc/modules-load.d/tun.conf 2>/dev/null \
+        || log "WARN: could not persist tun in /etc/modules-load.d/tun.conf"
+}
+
 sanitize_hostname() { printf '%s' "$1" | tr -c 'a-zA-Z0-9-' '-' | sed 's/-\+/-/g; s/^-//; s/-$//'; }
 
 build_up_cmd() {   # $1 hostname -> echoes the in-guest `tailscale up ...` command
@@ -703,11 +728,7 @@ main() {
     log "Log:  $LOG_FILE"
     log "----------------------------------------------------------------------"
 
-    # Ensure the tun module is available on the host for LXC TUN passthrough.
-    if ! lsmod | grep -qw '^tun'; then
-        modprobe tun 2>/dev/null || log "WARN: could not modprobe tun on host"
-        grep -qxF tun /etc/modules-load.d/tun.conf 2>/dev/null || echo tun >> /etc/modules-load.d/tun.conf 2>/dev/null || true
-    fi
+    ensure_host_tun
 
     # Union every running guest's LAN subnet(s) first, so each guest's firewall
     # can keep all the other containers/VMs/LXCs on the LAN reachable.

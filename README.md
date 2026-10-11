@@ -148,7 +148,7 @@ Every run writes a timestamped log to `/root/bulkvpn-<timestamp>.log` and prints
 - **nftables in LXC:** privileged containers work cleanly; unprivileged containers run the firewall in their own netns and usually work, but `/dev/net/tun` passthrough for Tailscale is more reliable in a privileged CT (a warning is logged).
 - **systemd only.** The kill-switch ships as systemd units; non-systemd guests (Alpine/OpenRC, etc.) are detected and skipped.
 - **VMs need qemu-guest-agent** installed and running, or they're skipped with a note.
-- **The Proxmox host itself is never modified** (beyond loading the `tun` kernel module for LXC passthrough) — only guests are touched.
+- **The Proxmox host itself is never modified** (beyond loading the `tun` kernel module for LXC passthrough) — only guests are touched. The module is loaded and persisted in `/etc/modules-load.d/tun.conf` only when it is neither built into the running kernel (`modules.builtin`) nor already loaded (`/sys/module/tun`); a dry run only reports that it would do so.
 
 ## Repository layout
 
