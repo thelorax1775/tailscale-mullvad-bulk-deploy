@@ -1,56 +1,11 @@
 #!/usr/bin/env bash
-#
-# bulkvpn-deploy.sh — bulk-deploy the Tailscale + Mullvad fail-closed
-# kill-switch across every LXC container and VM on a Proxmox VE node.
-#
-# For each RUNNING guest it will, idempotently:
-#   1. skip it if the kill-switch is already installed & scheduled,
-#   2. skip it (with a warning) if the guest is not systemd-based,
-#   3. install + enroll Tailscale if it isn't already on the tailnet,
-#   4. verify a Mullvad exit node is available on the tailnet,
-#   5. push in the kill-switch (nftables ruleset + rotate script + 3 systemd
-#      units), enable the boot firewall, start the 15-minute self-heal timer,
-#      and kick a first rotation so a verified exit node is selected.
-#
-# LXC guests are driven with `pct exec`; VMs via the QEMU guest agent
-# (`qm guest exec`) — a VM therefore needs qemu-guest-agent installed & running.
-#
-# Run as root on the Proxmox host.
-#
-# Combines and builds on:
-#   https://github.com/thelorax1775/tailscale-mullvad-killswitch
-#   https://github.com/thelorax1775/TailAdjuster
-#
-# --------------------------------------------------------------------------
-# Configuration (environment variables):
-#   TS_AUTHKEY               (required) Tailscale auth key for enrollment
-#   TS_LOGIN_SERVER          alt control server (e.g. Headscale); default: none
-#   TS_HOSTNAME_PREFIX       hostname prefix; default: "ct-" (LXC) / "vm-" (VM)
-#   TS_EXTRA_ARGS            extra flags appended to every `tailscale up`
-#   MULLVAD_LAN_AUTODETECT   1 (default) = auto-allow each guest's own LAN subnet(s)
-#   MULLVAD_LAN_INCLUDE_GUESTS 1 (default) = also allow every other running
-#                            guest's LAN subnet(s) on the node, so containers,
-#                            VMs, and LXCs stay reachable to each other on the LAN
-#   MULLVAD_LAN_SUBNET       extra subnet(s) to always allow (space/comma sep); default: none
-#   MULLVAD_COUNTRY_FILTER   limit rotation to a country (e.g. "USA"); default: any
-#   PVE_NODE                 Proxmox node to scan; default: `hostname -s`
-#   SELECT_GUESTS            space/comma-separated vmids to deploy to; default:
-#                            unset. When unset and a terminal is attached, an
-#                            interactive checklist (whiptail, or a numbered text
-#                            prompt fallback) lets you pick which running guests
-#                            get the kill-switch. When unset with no terminal
-#                            (cron/pipe), every running guest is selected.
-#   DRY_RUN                  1 = enumerate & classify only, change nothing
-#   FORCE_REDEPLOY           1 = re-push assets to every guest even if already
-#                            protected (use to roll out config/asset changes)
-#
-# Usage:  TS_AUTHKEY=tskey-... ./bulkvpn-deploy.sh [--help]
-# --------------------------------------------------------------------------
 
 set -Eeuo pipefail
 
 ### ---- Configuration -------------------------------------------------------
 TS_AUTHKEY="${TS_AUTHKEY:-}"
+TS_AUTHKEY_FILE="${TS_AUTHKEY_FILE:-}"
+TS_AUTHKEY_GUEST_PATH="/run/bulkvpn-ts-authkey"
 TS_LOGIN_SERVER="${TS_LOGIN_SERVER:-}"
 TS_HOSTNAME_PREFIX_LXC="${TS_HOSTNAME_PREFIX:-ct-}"
 TS_HOSTNAME_PREFIX_VM="${TS_HOSTNAME_PREFIX:-vm-}"
@@ -58,6 +13,8 @@ TS_EXTRA_ARGS="${TS_EXTRA_ARGS:-}"
 MULLVAD_LAN_AUTODETECT="${MULLVAD_LAN_AUTODETECT:-1}"   # 1 = auto-allow each guest's own LAN
 MULLVAD_LAN_INCLUDE_GUESTS="${MULLVAD_LAN_INCLUDE_GUESTS:-1}"  # 1 = also allow every other running guest's LAN subnet(s)
 MULLVAD_LAN_SUBNET="${MULLVAD_LAN_SUBNET:-}"            # extra subnet(s) to always allow (space/comma sep)
+MULLVAD_LAN_SCAN_EXCLUDE="${MULLVAD_LAN_SCAN_EXCLUDE:-}"
+MULLVAD_LAN_AGENT_QUERY="${MULLVAD_LAN_AGENT_QUERY:-1}"
 MULLVAD_COUNTRY_FILTER="${MULLVAD_COUNTRY_FILTER:-}"
 PVE_NODE="${PVE_NODE:-$(hostname -s)}"
 SELECT_GUESTS="${SELECT_GUESTS:-}"      # space/comma vmids to deploy to; empty = menu (TTY) or all (no TTY)
@@ -71,9 +28,80 @@ LOG_FILE="/root/bulkvpn-$(date '+%Y%m%d-%H%M%S').log"
 ### --------------------------------------------------------------------------
 
 SUCCESS=0; SKIPPED=0; FAILED=0
+WOULD_DEPLOY=0; WOULD_ENROLL=0; WOULD_FAIL=0
 SELECTED_IDS=""                         # space-separated vmids chosen for deploy
 
-usage() { sed -n '2,48p' "$0"; }
+usage() {
+cat <<'USAGE_EOF'
+bulkvpn-deploy.sh — bulk-deploy the Tailscale + Mullvad fail-closed
+kill-switch across every LXC container and VM on a Proxmox VE node.
+
+For each RUNNING guest it will, idempotently:
+  1. skip it if the kill-switch is already installed & scheduled,
+  2. skip it (with a warning) if the guest is not systemd-based,
+  3. install + enroll Tailscale only if the guest has never been on a
+     tailnet; a guest with existing Tailscale state whose status can't be
+     confirmed as Running is skipped with a warning, never rebooted or
+     re-enrolled,
+  4. verify a Mullvad exit node is available on the tailnet,
+  5. push in the kill-switch (nftables ruleset + rotate script + 3 systemd
+     units), enable the boot firewall, start the 15-minute self-heal timer,
+     and kick a first rotation so a verified exit node is selected.
+
+LXC guests are driven with `pct exec`; VMs via the QEMU guest agent
+(`qm guest exec`) — a VM therefore needs qemu-guest-agent installed & running.
+
+Run as root on the Proxmox host.
+
+Combines and builds on:
+  https://github.com/thelorax1775/tailscale-mullvad-killswitch
+  https://github.com/thelorax1775/TailAdjuster
+
+--------------------------------------------------------------------------
+Configuration (environment variables):
+  TS_AUTHKEY               Tailscale auth key for enrollment. Only needed when a
+                           selected guest has to be enrolled; such a guest
+                           FAILS without it, already-enrolled guests don't care
+  TS_AUTHKEY_FILE          path to a root-only file holding the auth key; used
+                           when TS_AUTHKEY is unset, keeps the key out of shell
+                           history
+  TS_LOGIN_SERVER          alt control server (e.g. Headscale); default: none
+  TS_HOSTNAME_PREFIX       hostname prefix; default: "ct-" (LXC) / "vm-" (VM)
+  TS_EXTRA_ARGS            extra flags appended to every `tailscale up`
+  MULLVAD_LAN_AUTODETECT   1 (default) = auto-allow each guest's own LAN subnet(s)
+  MULLVAD_LAN_INCLUDE_GUESTS 1 (default) = also allow every other running
+                           guest's LAN subnet(s) on the node, so containers,
+                           VMs, and LXCs stay reachable to each other on the LAN.
+                           The subnets come from the host side only (pct/qm
+                           config ip= / ipconfigN, else the host's subnet on the
+                           guest's bridge/VLAN); no guest is entered for this,
+                           and only private (RFC1918) subnets are used
+  MULLVAD_LAN_SCAN_EXCLUDE space/comma vmids left out of that cross-guest scan
+                           (e.g. a router VM whose WAN bridge isn't LAN)
+  MULLVAD_LAN_AGENT_QUERY  1 (default) = for SELECTED VMs only, also ask the QEMU
+                           guest agent for its addresses (network-get-interfaces,
+                           read-only); 0 = host-side config only
+  MULLVAD_LAN_SUBNET       extra subnet(s) to always allow (space/comma sep); default: none
+  MULLVAD_COUNTRY_FILTER   limit rotation to a country (e.g. "USA"); default: any
+  PVE_NODE                 Proxmox node to scan; default: `hostname -s`
+  SELECT_GUESTS            space/comma-separated vmids to deploy to; default:
+                           unset. When unset and a terminal is attached, an
+                           interactive checklist (whiptail, or a numbered text
+                           prompt fallback) lets you pick which running guests
+                           get the kill-switch. When unset with no terminal
+                           (cron/pipe), every running guest is selected.
+  DRY_RUN                  1 = change nothing; run the same read-only checks a
+                           real run does (guest agent, existing kill-switch,
+                           systemd, Tailscale state, Mullvad exit nodes) and
+                           report WOULD deploy / WOULD enroll / WOULD skip /
+                           WOULD fail per guest
+  FORCE_REDEPLOY           1 = re-push assets to every guest even if already
+                           protected (use to roll out config/asset changes)
+
+Usage:  TS_AUTHKEY=tskey-... ./bulkvpn-deploy.sh [--help]
+--------------------------------------------------------------------------
+USAGE_EOF
+}
 [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage; exit 0; }
 
 # Output is mirrored to a timestamped log from inside main(), *after* the guest
@@ -231,6 +259,21 @@ table inet mullvad_killswitch {
 
         udp dport 67 accept
     }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+
+        ct state established,related accept
+
+        oifname "tailscale0" accept
+
+        ip daddr $LAN accept
+
+        oifname "docker*" accept
+        oifname "br-*" accept
+        oifname "podman*" accept
+        oifname "cni*" accept
+    }
 }
 NFT_EOF
 }
@@ -323,7 +366,8 @@ lan_nft_set() {   # "a b c"
 GUEST_PM='pm_install(){ if command -v apt-get >/dev/null 2>&1; then export DEBIAN_FRONTEND=noninteractive; apt-get update -y >/dev/null && apt-get install -y "$@"; elif command -v dnf >/dev/null 2>&1; then dnf install -y "$@"; elif command -v yum >/dev/null 2>&1; then yum install -y "$@"; else echo "no supported package manager"; return 1; fi; }'
 
 CMD_HAS_SYSTEMD='test -d /run/systemd/system'
-CMD_TS_ACTIVE='command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1 && tailscale status 2>/dev/null | grep -q "100\."'
+# shellcheck disable=SC2016
+CMD_TS_PROBE='b=0; command -v tailscale >/dev/null 2>&1 && b=1; f=0; p=0; s=/var/lib/tailscale/tailscaled.state; if [ -s "$s" ]; then f=1; grep -qE "\"(_current-profile|_profiles|_daemon|profile-[^\"]+)\"" "$s" && p=1; fi; [ -n "$(ls -A /var/lib/tailscale 2>/dev/null)" ] && f=1; svc=$(systemctl is-active tailscaled 2>/dev/null); st=""; if [ "$b" = 1 ]; then for i in 1 2 3 4 5; do st=$(tailscale status --json 2>/dev/null | sed -n "s/.*\"BackendState\": *\"\([A-Za-z]*\)\".*/\1/p" | head -n1); case "$st" in ""|NoState|Starting) [ "$i" = 5 ] || sleep 2 ;; *) break ;; esac; done; fi; echo "bin=$b state=$f profile=$p svc=${svc:-none} backend=${st:-unknown}"'
 CMD_PROTECTED='test -x /usr/local/bin/mullvad-rotate.sh && systemctl is-enabled --quiet mullvad-killswitch.service && systemctl is-active --quiet mullvad-healthcheck.timer'
 CMD_MULLVAD_AVAIL='tailscale exit-node list 2>/dev/null | grep -qi "mullvad.ts.net"'
 # Print the guest's own directly-connected IPv4 LAN subnet(s), excluding
@@ -344,14 +388,38 @@ require_host_tools() {
     for t in pvesh pct qm jq base64; do
         command -v "$t" >/dev/null 2>&1 || die "required host tool not found: $t"
     done
-    [[ -n "$TS_AUTHKEY" ]] || die "TS_AUTHKEY is required (Tailscale auth key)"
+}
+
+host_tun_builtin() {
+    grep -qE '(^|/)tun\.ko' "/lib/modules/$(uname -r)/modules.builtin" 2>/dev/null
+}
+
+host_tun_loaded() { [[ -d /sys/module/tun ]]; }
+
+ensure_host_tun() {
+    if host_tun_builtin; then
+        log "Host: tun is built into the kernel — nothing to load"
+        return 0
+    fi
+    if host_tun_loaded; then
+        log "Host: tun module already loaded"
+        return 0
+    fi
+    if $DRY; then
+        log "Host: WOULD modprobe tun and add it to /etc/modules-load.d/tun.conf (dry run)"
+        return 0
+    fi
+    modprobe tun 2>/dev/null || log "WARN: could not modprobe tun on host"
+    grep -qxF tun /etc/modules-load.d/tun.conf 2>/dev/null \
+        || echo tun >> /etc/modules-load.d/tun.conf 2>/dev/null \
+        || log "WARN: could not persist tun in /etc/modules-load.d/tun.conf"
 }
 
 sanitize_hostname() { printf '%s' "$1" | tr -c 'a-zA-Z0-9-' '-' | sed 's/-\+/-/g; s/^-//; s/-$//'; }
 
 build_up_cmd() {   # $1 hostname -> echoes the in-guest `tailscale up ...` command
     local host="$1" cmd
-    cmd="tailscale up --authkey='${TS_AUTHKEY}' --hostname='${host}'"
+    cmd="tailscale up --auth-key='file:${TS_AUTHKEY_GUEST_PATH}' --hostname='${host}'"
     [[ -n "$TS_LOGIN_SERVER" ]] && cmd+=" --login-server='${TS_LOGIN_SERVER}'"
     [[ -n "$TS_EXTRA_ARGS"   ]] && cmd+=" ${TS_EXTRA_ARGS}"
     # If an exit node is used at enrollment (e.g. pinned via TS_EXTRA_ARGS),
@@ -374,6 +442,29 @@ vm_guest_exec() {
     [[ -n "$out" ]] && printf '%s' "$out"
     [[ -n "$rc" ]] || rc=91
     return "$rc"
+}
+
+push_authkey() {
+    local engine="$1" id="$2" tmp rc
+    case "$engine" in
+        lxc)
+            tmp="$(umask 077; mktemp)" || return 1
+            printf '%s' "$TS_AUTHKEY" > "$tmp"
+            pct push "$id" "$tmp" "$TS_AUTHKEY_GUEST_PATH" --perms 0600
+            rc=$?
+            rm -f "$tmp"
+            return "$rc"
+            ;;
+        vm)
+            printf '%s' "$TS_AUTHKEY" \
+                | qm guest exec "$id" --timeout "$VM_EXEC_TIMEOUT" --pass-stdin 1 -- \
+                    sh -c "umask 077; cat > '$TS_AUTHKEY_GUEST_PATH'" >/dev/null 2>&1
+            ;;
+    esac
+}
+
+remove_authkey() {
+    run_guest "$1" "$2" "rm -f '$TS_AUTHKEY_GUEST_PATH'" >/dev/null 2>&1 || true
 }
 
 run_guest() {   # engine id cmd
@@ -401,6 +492,12 @@ wait_for_lxc_ready() {
         sleep 1
     done
     return 1
+}
+
+lxc_tun_configured() {
+    local conf="/etc/pve/lxc/${1}.conf"
+    grep -q '^lxc.cgroup2.devices.allow: c 10:200 rwm' "$conf" 2>/dev/null \
+        && grep -q '^lxc.mount.entry: /dev/net/tun' "$conf" 2>/dev/null
 }
 
 enable_tun_lxc() {   # returns 0 = no change, 1 = changed (reboot needed)
@@ -461,101 +558,154 @@ deploy_killswitch() {   # engine id label
 }
 
 ### ---- Per-guest orchestration ---------------------------------------------
-process_lxc() {
-    local vmid="$1" name="$2" label host reboot=0
-    label="ct/${vmid} (${name})"
-    host="$(sanitize_hostname "${TS_HOSTNAME_PREFIX_LXC}${name}")"
-    log "LXC $label"
+ts_classify() {
+    local probe="$1" bin state profile svc backend
+    if [[ ! "$probe" =~ bin=([01])\ state=([01])\ profile=([01])\ svc=([^ ]*)\ backend=([A-Za-z]+) ]]; then
+        printf 'keep|could not read Tailscale state from the guest'
+        return 0
+    fi
+    bin="${BASH_REMATCH[1]}"; state="${BASH_REMATCH[2]}"; profile="${BASH_REMATCH[3]}"
+    svc="${BASH_REMATCH[4]}"; backend="${BASH_REMATCH[5]}"
 
-    if run_guest lxc "$vmid" "$CMD_PROTECTED"; then
-        if ! $FORCE; then
-            log "  [$label] SKIP — kill-switch already installed & scheduled (set FORCE_REDEPLOY=1 to re-push)"; inc SKIPPED; return 0
-        fi
-        log "  [$label] FORCE_REDEPLOY — re-pushing assets to already-protected guest"
-    fi
-    if ! run_guest lxc "$vmid" "$CMD_HAS_SYSTEMD"; then
-        log "  [$label] SKIP — guest is not systemd-based"; inc SKIPPED; return 0
-    fi
-    if $DRY; then
-        log "  [$label] WOULD deploy (dry run)"; inc SKIPPED; return 0
-    fi
-
-    # Tailscale layer.
-    if ! run_guest lxc "$vmid" "$CMD_TS_ACTIVE"; then
-        lxc_is_unprivileged "$vmid" && log "  [$label] WARN: unprivileged CT — /dev/net/tun may need a privileged container"
-        if enable_tun_lxc "$vmid"; then :; else reboot=1; fi
-        if (( reboot )); then
-            log "  [$label] added /dev/net/tun to config — rebooting CT"
-            pct reboot "$vmid" >/dev/null 2>&1 || true
-            wait_for_lxc_ready "$vmid" || { log "  [$label] FAILED — CT not ready after reboot"; inc FAILED; return 0; }
-        fi
-        log "  [$label] installing Tailscale"
-        run_guest lxc "$vmid" "$CMD_INSTALL_TS" || { log "  [$label] FAILED to install Tailscale"; inc FAILED; return 0; }
-        log "  [$label] enrolling into tailnet as '$host'"
-        if ! run_guest lxc "$vmid" "$(build_up_cmd "$host")"; then
-            log "  [$label] join failed — rebooting and retrying once"
-            pct reboot "$vmid" >/dev/null 2>&1 || true
-            wait_for_lxc_ready "$vmid" || true
-            run_guest lxc "$vmid" "$(build_up_cmd "$host")" \
-                || { log "  [$label] FAILED to join tailnet"; inc FAILED; return 0; }
-        fi
+    if [[ "$backend" == "Running" ]]; then
+        printf 'ready|'
+    elif [[ "$profile" == "1" && "$backend" == "unknown" ]]; then
+        printf 'keep|Tailscale has a login profile but its status could not be read after retries (tailscaled: %s)' "$svc"
+    elif [[ "$profile" == "1" ]]; then
+        printf 'keep|Tailscale has a login profile but its backend is %s (tailscaled: %s)' "$backend" "$svc"
+    elif [[ "$bin" == "0" && "$state" == "1" ]]; then
+        printf 'keep|/var/lib/tailscale holds state but the tailscale binary is missing'
+    elif [[ "$bin" == "0" ]]; then
+        printf 'install|'
+    elif [[ "$backend" == "NeedsLogin" ]]; then
+        printf 'enroll|'
+    elif [[ "$backend" == "unknown" ]]; then
+        printf 'keep|tailscale is installed but its status could not be read after retries (tailscaled: %s)' "$svc"
     else
-        log "  [$label] Tailscale already active"
-    fi
-
-    if ! run_guest lxc "$vmid" "$CMD_MULLVAD_AVAIL"; then
-        log "  [$label] SKIP — no Mullvad exit node visible on tailnet (nothing to protect with)"; inc SKIPPED; return 0
-    fi
-
-    if deploy_killswitch lxc "$vmid" "$label"; then
-        log "  [$label] SUCCESS — kill-switch deployed & scheduled"; inc SUCCESS
-    else
-        inc FAILED
+        printf 'keep|tailscale is installed but its backend is %s (tailscaled: %s)' "$backend" "$svc"
     fi
 }
 
-process_vm() {
-    local vmid="$1" name="$2" label host
-    label="vm/${vmid} (${name})"
-    host="$(sanitize_hostname "${TS_HOSTNAME_PREFIX_VM}${name}")"
-    log "VM $label"
+guest_reboot() {
+    case "$1" in
+        lxc) pct reboot "$2" >/dev/null 2>&1 || true; wait_for_lxc_ready "$2" ;;
+        vm)  qm reboot "$2" >/dev/null 2>&1 || true; wait_for_vm_agent "$2" ;;
+    esac
+}
 
-    if ! wait_for_vm_agent "$vmid"; then
-        log "  [$label] SKIP — qemu-guest-agent not responding (install & start it in the guest)"; inc SKIPPED; return 0
+enroll_guest() {
+    local engine="$1" id="$2" label="$3" host="$4" action="$5"
+
+    if [[ -z "$TS_AUTHKEY" ]]; then
+        log "  [$label] FAILED — guest needs Tailscale enrollment but TS_AUTHKEY is not set"
+        return 1
     fi
-    if run_guest vm "$vmid" "$CMD_PROTECTED"; then
-        if ! $FORCE; then
-            log "  [$label] SKIP — kill-switch already installed & scheduled (set FORCE_REDEPLOY=1 to re-push)"; inc SKIPPED; return 0
+
+    if [[ "$engine" == "lxc" && "$action" == "install" ]]; then
+        lxc_is_unprivileged "$id" && log "  [$label] WARN: unprivileged CT — /dev/net/tun may need a privileged container"
+        if ! enable_tun_lxc "$id"; then
+            log "  [$label] added /dev/net/tun to config — rebooting CT"
+            guest_reboot lxc "$id" || { log "  [$label] FAILED — CT not ready after reboot"; return 1; }
         fi
-        log "  [$label] FORCE_REDEPLOY — re-pushing assets to already-protected guest"
-    fi
-    if ! run_guest vm "$vmid" "$CMD_HAS_SYSTEMD"; then
-        log "  [$label] SKIP — guest is not systemd-based"; inc SKIPPED; return 0
-    fi
-    if $DRY; then
-        log "  [$label] WOULD deploy (dry run)"; inc SKIPPED; return 0
     fi
 
-    if ! run_guest vm "$vmid" "$CMD_TS_ACTIVE"; then
+    if [[ "$action" == "install" ]]; then
         log "  [$label] installing Tailscale"
-        run_guest vm "$vmid" "$CMD_INSTALL_TS" || { log "  [$label] FAILED to install Tailscale"; inc FAILED; return 0; }
-        log "  [$label] enrolling into tailnet as '$host'"
-        if ! run_guest vm "$vmid" "$(build_up_cmd "$host")"; then
-            log "  [$label] join failed — rebooting and retrying once"
-            qm reboot "$vmid" >/dev/null 2>&1 || true
-            wait_for_vm_agent "$vmid" || true
-            run_guest vm "$vmid" "$(build_up_cmd "$host")" \
-                || { log "  [$label] FAILED to join tailnet"; inc FAILED; return 0; }
-        fi
+        run_guest "$engine" "$id" "$CMD_INSTALL_TS" || { log "  [$label] FAILED to install Tailscale"; return 1; }
+    fi
+
+    log "  [$label] enrolling into tailnet as '$host'"
+    push_authkey "$engine" "$id" || { log "  [$label] FAILED to place the auth key in the guest"; return 1; }
+    if ! run_guest "$engine" "$id" "$(build_up_cmd "$host")"; then
+        log "  [$label] join failed — rebooting and retrying once"
+        guest_reboot "$engine" "$id" || true
+        push_authkey "$engine" "$id" || { log "  [$label] FAILED to place the auth key in the guest"; return 1; }
+        run_guest "$engine" "$id" "$(build_up_cmd "$host")" \
+            || { remove_authkey "$engine" "$id"; log "  [$label] FAILED to join tailnet"; return 1; }
+    fi
+    remove_authkey "$engine" "$id"
+    return 0
+}
+
+skip_guest() {
+    if $DRY; then
+        log "  [$1] WOULD skip — $2"
     else
-        log "  [$label] Tailscale already active"
+        log "  [$1] SKIP — $2"
+    fi
+    inc SKIPPED
+}
+
+dry_enroll_report() {
+    local engine="$1" id="$2" label="$3" host="$4" action="$5" steps=""
+    if [[ -z "$TS_AUTHKEY" ]]; then
+        log "  [$label] WOULD fail — guest needs Tailscale enrollment but TS_AUTHKEY is not set"
+        inc WOULD_FAIL
+        return 0
+    fi
+    if [[ "$engine" == "lxc" && "$action" == "install" ]] && ! lxc_tun_configured "$id"; then
+        steps+="add /dev/net/tun to the CT config and reboot the CT, "
+    fi
+    [[ "$action" == "install" ]] && steps+="install Tailscale, "
+    log "  [$label] WOULD enroll — ${steps}join the tailnet as '$host', then deploy if a Mullvad exit node becomes visible (dry run)"
+    inc WOULD_ENROLL
+}
+
+process_guest() {
+    local engine="$1" vmid="$2" name="$3" kind label host probe verdict action reason
+    if [[ "$engine" == "lxc" ]]; then
+        kind="LXC"; label="ct/${vmid} (${name})"
+        host="$(sanitize_hostname "${TS_HOSTNAME_PREFIX_LXC}${name}")"
+    else
+        kind="VM"; label="vm/${vmid} (${name})"
+        host="$(sanitize_hostname "${TS_HOSTNAME_PREFIX_VM}${name}")"
+    fi
+    log "$kind $label"
+
+    if [[ "$engine" == "vm" ]] && ! wait_for_vm_agent "$vmid"; then
+        skip_guest "$label" "qemu-guest-agent not responding (install & start it in the guest)"; return 0
+    fi
+    if run_guest "$engine" "$vmid" "$CMD_PROTECTED"; then
+        if ! $FORCE; then
+            skip_guest "$label" "kill-switch already installed & scheduled (set FORCE_REDEPLOY=1 to re-push)"; return 0
+        fi
+        if $DRY; then
+            log "  [$label] FORCE_REDEPLOY — already protected; checking whether a re-push would go ahead"
+        else
+            log "  [$label] FORCE_REDEPLOY — re-pushing assets to already-protected guest"
+        fi
+    fi
+    if ! run_guest "$engine" "$vmid" "$CMD_HAS_SYSTEMD"; then
+        skip_guest "$label" "guest is not systemd-based"; return 0
     fi
 
-    if ! run_guest vm "$vmid" "$CMD_MULLVAD_AVAIL"; then
-        log "  [$label] SKIP — no Mullvad exit node visible on tailnet (nothing to protect with)"; inc SKIPPED; return 0
+    probe="$(run_guest "$engine" "$vmid" "$CMD_TS_PROBE" 2>/dev/null | tr -d '\r')" || true
+    verdict="$(ts_classify "$probe")"
+    action="${verdict%%|*}"; reason="${verdict#*|}"
+    case "$action" in
+        ready)
+            log "  [$label] Tailscale already active" ;;
+        install|enroll)
+            if $DRY; then
+                dry_enroll_report "$engine" "$vmid" "$label" "$host" "$action"; return 0
+            fi
+            enroll_guest "$engine" "$vmid" "$label" "$host" "$action" || { inc FAILED; return 0; } ;;
+        *)
+            skip_guest "$label" "WARN: ${reason}. Not rebooting or re-enrolling a guest that may already be on the tailnet; fix Tailscale in the guest and re-run."
+            return 0 ;;
+    esac
+
+    if ! run_guest "$engine" "$vmid" "$CMD_MULLVAD_AVAIL"; then
+        skip_guest "$label" "no Mullvad exit node visible on tailnet (nothing to protect with)"; return 0
     fi
 
-    if deploy_killswitch vm "$vmid" "$label"; then
+    if $DRY; then
+        log "  [$label] WOULD deploy — LAN kept reachable: $(lan_nft_set "$(resolve_lan_list "$engine" "$vmid")") (dry run)"
+        inc WOULD_DEPLOY
+        return 0
+    fi
+
+    if deploy_killswitch "$engine" "$vmid" "$label"; then
         log "  [$label] SUCCESS — kill-switch deployed & scheduled"; inc SUCCESS
     else
         inc FAILED
@@ -652,29 +802,111 @@ select_guests() {
 }
 
 ### ---- Cross-guest LAN discovery -------------------------------------------
-# collect_guest_lans: sweep every RUNNING guest once up-front and union their
-# directly-connected LAN subnet(s) into GUEST_LAN_SET, so resolve_lan() can keep
-# each guest reachable to all the other containers/VMs/LXCs on the LAN — not
-# just to its own subnet. Read-only (`ip route`), so it is safe in DRY_RUN too.
+cidr_network() {
+    local a b c d len n m
+    [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]] || return 1
+    a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]}))
+    c=$((10#${BASH_REMATCH[3]})); d=$((10#${BASH_REMATCH[4]}))
+    len=$((10#${BASH_REMATCH[5]}))
+    (( a < 256 && b < 256 && c < 256 && d < 256 && len <= 32 )) || return 1
+    n=$(( (a << 24) | (b << 16) | (c << 8) | d ))
+    m=$(( len == 0 ? 0 : (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+    n=$(( n & m ))
+    printf '%d.%d.%d.%d/%d\n' $(( (n >> 24) & 255 )) $(( (n >> 16) & 255 )) $(( (n >> 8) & 255 )) $(( n & 255 )) "$len"
+}
+
+lan_cidr_filter() {
+    grep -E '^[0-9.]+/[0-9]+$' | grep -vE '^(127|169\.254|100)\.' | sort -u || true
+}
+
+private_cidr_filter() {
+    awk -F'[./]' '
+        NF == 5 && (($1 == 10 && $5 >= 8) ||
+                    ($1 == 172 && $2 >= 16 && $2 <= 31 && $5 >= 12) ||
+                    ($1 == 192 && $2 == 168 && $5 >= 16)) { print }'
+}
+
+host_bridge_subnets() {
+    local dev="$1"
+    [[ -n "$dev" ]] || return 0
+    [[ -n "${2:-}" ]] && dev="${1}.${2}"
+    { ip -4 -o route show dev "$dev" scope link 2>/dev/null || true; } | awk '{ print $1 }'
+}
+
+pve_net_subnets() {
+    local cfg="$1" line idx kv bridge tag ip
+    local -a kvs=()
+    local -A net_bridge=() net_tag=() net_ip=()
+    while IFS= read -r line; do
+        [[ "$line" =~ ^(net|ipconfig)([0-9]+):\ (.*)$ ]] || continue
+        idx="${BASH_REMATCH[2]}"
+        IFS=, read -ra kvs <<<"${BASH_REMATCH[3]}"
+        for kv in "${kvs[@]}"; do
+            case "$kv" in
+                bridge=*) net_bridge[$idx]="${kv#bridge=}" ;;
+                tag=*)    net_tag[$idx]="${kv#tag=}" ;;
+                ip=*)     net_ip[$idx]="${kv#ip=}" ;;
+            esac
+        done
+    done <<<"$cfg"
+    for idx in "${!net_bridge[@]}"; do
+        bridge="${net_bridge[$idx]}"; tag="${net_tag[$idx]:-}"; ip="${net_ip[$idx]:-}"
+        if [[ "$ip" == */* ]]; then
+            cidr_network "$ip" || true
+        else
+            host_bridge_subnets "$bridge" "$tag"
+        fi
+    done
+    return 0
+}
+
+vm_agent_subnets() {
+    local cidr
+    qm guest cmd "$1" network-get-interfaces 2>/dev/null \
+        | jq -r '.[]? | select((.name // "") | test("^(lo$|tailscale|docker|br-|veth|cni|podman)") | not)
+                 | ."ip-addresses"[]? | select(."ip-address-type" == "ipv4")
+                 | "\(."ip-address")/\(.prefix)"' 2>/dev/null \
+        | while IFS= read -r cidr; do cidr_network "$cidr" || true; done
+}
+
+is_scan_excluded() {
+    [[ " $(printf '%s' "$MULLVAD_LAN_SCAN_EXCLUDE" | tr ',' ' ') " == *" $1 "* ]]
+}
+
 collect_guest_lans() {
     [[ "$MULLVAD_LAN_INCLUDE_GUESTS" == "1" ]] || return 0
-    local vmid status name detected subs=""
+    local vmid status name found kept dropped subs="" eng elabel
 
-    log "Pre-scan: collecting LAN subnets across all running guests ..."
-    while IFS=$'\t' read -r vmid status name; do
-        [[ "$status" == "running" ]] || continue
-        detected="$(run_guest lxc "$vmid" "$CMD_DETECT_LAN" 2>/dev/null | tr -d '\r')" || true
-        [[ -n "$detected" ]] && subs+=" $detected"
-    done < <(list_guests lxc)
+    log "Pre-scan: collecting LAN subnets from host-side guest config (no guest is entered) ..."
+    for eng in lxc qemu; do
+        [[ "$eng" == "lxc" ]] && elabel="ct" || elabel="vm"
+        while IFS=$'\t' read -r vmid status name; do
+            [[ "$status" == "running" ]] || continue
+            if is_scan_excluded "$vmid"; then
+                log "Pre-scan: ${elabel}/${vmid} (${name}) excluded by MULLVAD_LAN_SCAN_EXCLUDE"
+                continue
+            fi
+            if [[ "$eng" == "lxc" ]]; then
+                found="$(pve_net_subnets "$(pct config "$vmid" 2>/dev/null)" | lan_cidr_filter)"
+            else
+                found="$(pve_net_subnets "$(qm config "$vmid" 2>/dev/null)" | lan_cidr_filter)"
+                if [[ "$MULLVAD_LAN_AGENT_QUERY" == "1" ]] && is_selected "$vmid" && vm_agent_ready "$vmid"; then
+                    found="$(printf '%s\n%s\n' "$found" "$(vm_agent_subnets "$vmid")" | lan_cidr_filter)"
+                fi
+            fi
+            kept="$(printf '%s\n' "$found" | private_cidr_filter | paste -sd' ' -)"
+            dropped="$(printf '%s\n' "$found" | { grep -vxF -f <(printf '%s\n' "$kept" | tr ' ' '\n') || true; } | paste -sd' ' -)"
+            [[ -n "$dropped" ]] && log "Pre-scan: ${elabel}/${vmid} (${name}) ignoring non-private subnet(s): ${dropped} (add them with MULLVAD_LAN_SUBNET if they really are LAN)"
+            if [[ -n "$kept" ]]; then
+                log "Pre-scan: ${elabel}/${vmid} (${name}) -> ${kept}"
+                subs+=" ${kept}"
+            elif [[ -z "$found" ]]; then
+                log "Pre-scan: ${elabel}/${vmid} (${name}) -> nothing derivable"
+            fi
+        done < <(list_guests "$eng")
+    done
 
-    while IFS=$'\t' read -r vmid status name; do
-        [[ "$status" == "running" ]] || continue
-        vm_agent_ready "$vmid" || continue   # unreachable VMs are simply not counted
-        detected="$(run_guest vm "$vmid" "$CMD_DETECT_LAN" 2>/dev/null | tr -d '\r')" || true
-        [[ -n "$detected" ]] && subs+=" $detected"
-    done < <(list_guests qemu)
-
-    GUEST_LAN_SET="$(printf '%s' "$subs" | tr ' ' '\n' | grep -E '/[0-9]+$' | sort -u | tr '\n' ' ')"
+    GUEST_LAN_SET="$(printf '%s' "$subs" | tr ' ' '\n' | lan_cidr_filter | tr '\n' ' ')"
     if [[ -n "$GUEST_LAN_SET" ]]; then
         log "Pre-scan: guest LAN subnets kept reachable everywhere: ${GUEST_LAN_SET}"
     else
@@ -698,14 +930,15 @@ main() {
     [[ "$MULLVAD_LAN_INCLUDE_GUESTS" == "1" ]] && lanmode+=" +all-guests"
     log "Node: $PVE_NODE   LAN: $lanmode   Country: ${MULLVAD_COUNTRY_FILTER:-any}   Dry-run: $DRY   Force-redeploy: $FORCE"
     log "Selected guests: $SELECTED_IDS"
+    if [[ -z "$TS_AUTHKEY" && -n "$TS_AUTHKEY_FILE" ]]; then
+        [[ -r "$TS_AUTHKEY_FILE" ]] || die "TS_AUTHKEY_FILE is set but not readable: $TS_AUTHKEY_FILE"
+        TS_AUTHKEY="$(tr -d '\r\n' < "$TS_AUTHKEY_FILE")"
+    fi
+    [[ -n "$TS_AUTHKEY" ]] || log "TS_AUTHKEY not set — fine if every selected guest is already on the tailnet; a guest that needs enrollment will fail"
     log "Log:  $LOG_FILE"
     log "----------------------------------------------------------------------"
 
-    # Ensure the tun module is available on the host for LXC TUN passthrough.
-    if ! lsmod | grep -qw '^tun'; then
-        modprobe tun 2>/dev/null || log "WARN: could not modprobe tun on host"
-        grep -qxF tun /etc/modules-load.d/tun.conf 2>/dev/null || echo tun >> /etc/modules-load.d/tun.conf 2>/dev/null || true
-    fi
+    ensure_host_tun
 
     # Union every running guest's LAN subnet(s) first, so each guest's firewall
     # can keep all the other containers/VMs/LXCs on the LAN reachable.
@@ -716,7 +949,7 @@ main() {
     while IFS=$'\t' read -r vmid status name; do
         [[ "$status" == "running" ]] || { log "LXC ct/${vmid} (${name}) SKIP — not running"; inc SKIPPED; continue; }
         is_selected "$vmid" || { log "LXC ct/${vmid} (${name}) SKIP — not selected"; inc SKIPPED; continue; }
-        process_lxc "$vmid" "$name" || log "LXC ct/${vmid}: unexpected error (continuing)"
+        process_guest lxc "$vmid" "$name" || log "LXC ct/${vmid}: unexpected error (continuing)"
     done < <(list_guests lxc)
 
     log "----------------------------------------------------------------------"
@@ -724,11 +957,15 @@ main() {
     while IFS=$'\t' read -r vmid status name; do
         [[ "$status" == "running" ]] || { log "VM vm/${vmid} (${name}) SKIP — not running"; inc SKIPPED; continue; }
         is_selected "$vmid" || { log "VM vm/${vmid} (${name}) SKIP — not selected"; inc SKIPPED; continue; }
-        process_vm "$vmid" "$name" || log "VM vm/${vmid}: unexpected error (continuing)"
+        process_guest vm "$vmid" "$name" || log "VM vm/${vmid}: unexpected error (continuing)"
     done < <(list_guests qemu)
 
     log "----------------------------------------------------------------------"
-    log "Done.  SUCCESS=$SUCCESS  SKIPPED=$SKIPPED  FAILED=$FAILED"
+    if $DRY; then
+        log "Done (dry run, nothing changed).  WOULD_DEPLOY=$WOULD_DEPLOY  WOULD_ENROLL=$WOULD_ENROLL  WOULD_FAIL=$WOULD_FAIL  SKIPPED=$SKIPPED  FAILED=$FAILED"
+    else
+        log "Done.  SUCCESS=$SUCCESS  SKIPPED=$SKIPPED  FAILED=$FAILED"
+    fi
     log "Full log: $LOG_FILE"
     (( FAILED == 0 ))
 }

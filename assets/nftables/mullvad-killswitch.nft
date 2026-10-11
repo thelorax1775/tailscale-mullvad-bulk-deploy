@@ -41,4 +41,19 @@ table inet mullvad_killswitch {
         # Everything else — raw internet egress over the physical NIC — is
         # dropped by the chain policy. That is the leak protection.
     }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+
+        ct state established,related accept
+
+        oifname "tailscale0" accept
+
+        ip daddr $LAN accept
+
+        oifname "docker*" accept
+        oifname "br-*" accept
+        oifname "podman*" accept
+        oifname "cni*" accept
+    }
 }
