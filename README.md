@@ -28,7 +28,11 @@ enumerate running LXC + VMs on the node
   └─ for each guest:
        already protected?          → SKIP
        not systemd-based?          → SKIP (warn)  [kill-switch ships as systemd units]
-       Tailscale not on tailnet?   → install + enroll (needs TS_AUTHKEY)
+       Tailscale Running?          → use it as is
+       never on a tailnet?         → install (if missing) + enroll (needs TS_AUTHKEY,
+                                     else FAIL for this guest only)
+       has Tailscale state but not
+       confirmed Running?          → SKIP (warn) — never rebooted or re-enrolled
        no Mullvad exit node seen?  → SKIP (no endpoint to protect with; never fail-close)
        deploy kill-switch:
          push 5 assets, template LAN subnet(s) (own + all guests) + country filter,
@@ -54,8 +58,12 @@ enumerate running LXC + VMs on the node
 Run it directly on the Proxmox host as `root` (no `sudo` needed):
 
 ```bash
-# minimum: a Tailscale auth key
+# with an auth key, so guests that aren't on the tailnet yet can be enrolled
 TS_AUTHKEY=tskey-auth-xxxxxxdeploy ./bulkvpn-deploy.sh
+
+# without one: fine when every selected guest is already on the tailnet;
+# any guest that would need enrollment is reported as FAILED and left alone
+./bulkvpn-deploy.sh
 
 # see what it would do, change nothing
 DRY_RUN=1 TS_AUTHKEY=tskey-... ./bulkvpn-deploy.sh
@@ -132,7 +140,7 @@ By default each guest's own LAN subnet is **auto-detected and kept reachable**, 
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `TS_AUTHKEY` | *(required)* | Tailscale auth key used to enroll guests that aren't on the tailnet |
+| `TS_AUTHKEY` | *(none)* | Tailscale auth key used to enroll guests that have never been on the tailnet. Only needed if such a guest is selected; without it that guest is reported as `FAILED` and nothing in it is changed, while already-enrolled guests deploy normally. |
 | `TS_LOGIN_SERVER` | *(none)* | Alternative control server (e.g. Headscale) |
 | `TS_HOSTNAME_PREFIX` | `ct-` (LXC) / `vm-` (VM) | Prefix for each guest's tailnet hostname |
 | `TS_EXTRA_ARGS` | *(none)* | Extra flags appended to every `tailscale up` |
@@ -160,6 +168,7 @@ Every run writes a timestamped log to `/root/bulkvpn-<timestamp>.log` and prints
 
 - **LAN access is automatic.** Each guest's own directly-connected LAN subnet(s) are auto-detected (from its link routes, excluding loopback / link-local / the Tailscale CGNAT range) and allowed by the firewall, so SSH / web UIs stay reachable without configuration. In addition, a one-time pre-scan unions the LAN subnet(s) of *every* running container / VM / LXC on the node (read from host-side config, without entering unselected guests — see [Choosing which guests get the kill-switch](#choosing-which-guests-get-the-kill-switch)) and allows that whole set on every guest, so guests stay reachable to each other on the same LAN subnet(s) they were on before — set `MULLVAD_LAN_INCLUDE_GUESTS=0` to allow only each guest's own subnet. If nothing is detectable the firewall falls back to the private RFC1918 ranges (never locks you out). Set `MULLVAD_LAN_SUBNET` to add extra subnets (e.g. a separate management VLAN), or `MULLVAD_LAN_AUTODETECT=0` to allow *only* what you list. On the Tailscale side, `--exit-node-allow-lan-access=true` is set automatically whenever an exit node is in use — the rotate script sets it on every node switch, and enrollment adds it too if you pin an exit node via `TS_EXTRA_ARGS` — so routing traffic through an exit node never blackholes direct access to your local network. Because `--exit-node-allow-lan-access` only exempts each guest's *own* directly-connected subnet, the rotate script additionally installs a high-priority `ip rule` (`to <subnet> lookup main`, priority 5200 — above Tailscale's diverter) for every allowed subnet, so traffic to *other* LAN subnets reached via the gateway egresses directly instead of being swallowed into the tunnel. That's what lets containers/VMs/LXCs on different subnets keep pinging each other once the kill-switch is active; the rules are runtime-only and re-asserted on every self-heal run (2 min after boot, then every 15 min).
 - **Fail-closed ordering is enforced.** Tailscale + a visible Mullvad exit node are verified *before* the drop-policy firewall is loaded. A guest with no Mullvad exit node visible on the tailnet is **skipped** and left untouched rather than cut off — the kill-switch is only ever deployed where there's an endpoint to protect with.
+- **Enrolled guests are never re-enrolled.** Before touching Tailscale the script reads, inside the guest, whether the `tailscale` binary exists, whether `/var/lib/tailscale/tailscaled.state` holds a login profile, whether `tailscaled` is active, and the `BackendState` from `tailscale status --json` (retried 5 times, 2 s apart, to ride out a daemon that is restarting). Only a guest with no Tailscale at all is installed and enrolled (and, for a CT, given `/dev/net/tun` and rebooted); a guest with Tailscale installed, no login profile and `BackendState=NeedsLogin` is enrolled without install or reboot. Any guest that has Tailscale state but isn't confirmed `Running` (expired key, `Stopped`, daemon down, status unreadable, or the probe itself failed) is **skipped with a warning** and nothing in it or its CT config is changed — fix Tailscale in that guest by hand, then re-run.
 - **nftables in LXC:** privileged containers work cleanly; unprivileged containers run the firewall in their own netns and usually work, but `/dev/net/tun` passthrough for Tailscale is more reliable in a privileged CT (a warning is logged).
 - **Forwarding is fail-closed too.** A guest that forwards traffic for other machines — a Linux NAT gateway, or a Tailscale subnet router or exit node advertising anything beyond the allowed LAN subnets — will have that forwarded traffic dropped unless it goes out `tailscale0` or to an allowed LAN subnet. Container bridges with names outside `docker*` / `br-*` / `podman*` / `cni*` (LXD, Incus, libvirt `virbr0`) are not on the allowlist, so traffic into them is allowed only when their subnet is in the LAN set. Re-deploying to a guest that is already protected needs `FORCE_REDEPLOY=1` to pick up the forward chain.
 - **systemd only.** The kill-switch ships as systemd units; non-systemd guests (Alpine/OpenRC, etc.) are detected and skipped.

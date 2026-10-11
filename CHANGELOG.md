@@ -35,6 +35,19 @@
   `network-get-interfaces`. Only private (RFC1918) subnets are accepted from
   the pre-scan; others are logged and ignored.
 
+- A guest that is already on the tailnet is no longer rebooted and
+  re-enrolled when `tailscale status` fails. Any failure of the old
+  `tailscale status` check sent the guest down the "not on tailnet" path:
+  add `/dev/net/tun` to the CT config, reboot the CT, reinstall Tailscale and
+  `tailscale up` with whatever `TS_AUTHKEY` was given. The script now probes
+  the binary, the `tailscaled` unit, the login profile in
+  `/var/lib/tailscale/tailscaled.state` and `BackendState` (with retries), and
+  only installs/enrolls guests that have never been logged in. Guests with
+  existing state that aren't confirmed `Running` are skipped with a warning.
+- `TS_AUTHKEY` is no longer required up front. It is checked per guest at the
+  moment a guest actually needs enrollment; that guest fails with a clear
+  message and the run continues.
+
 ### Added
 
 - `MULLVAD_LAN_SCAN_EXCLUDE`: vmids to leave out of the LAN pre-scan.
