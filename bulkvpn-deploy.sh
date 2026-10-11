@@ -1,51 +1,4 @@
 #!/usr/bin/env bash
-#
-# bulkvpn-deploy.sh — bulk-deploy the Tailscale + Mullvad fail-closed
-# kill-switch across every LXC container and VM on a Proxmox VE node.
-#
-# For each RUNNING guest it will, idempotently:
-#   1. skip it if the kill-switch is already installed & scheduled,
-#   2. skip it (with a warning) if the guest is not systemd-based,
-#   3. install + enroll Tailscale if it isn't already on the tailnet,
-#   4. verify a Mullvad exit node is available on the tailnet,
-#   5. push in the kill-switch (nftables ruleset + rotate script + 3 systemd
-#      units), enable the boot firewall, start the 15-minute self-heal timer,
-#      and kick a first rotation so a verified exit node is selected.
-#
-# LXC guests are driven with `pct exec`; VMs via the QEMU guest agent
-# (`qm guest exec`) — a VM therefore needs qemu-guest-agent installed & running.
-#
-# Run as root on the Proxmox host.
-#
-# Combines and builds on:
-#   https://github.com/thelorax1775/tailscale-mullvad-killswitch
-#   https://github.com/thelorax1775/TailAdjuster
-#
-# --------------------------------------------------------------------------
-# Configuration (environment variables):
-#   TS_AUTHKEY               (required) Tailscale auth key for enrollment
-#   TS_LOGIN_SERVER          alt control server (e.g. Headscale); default: none
-#   TS_HOSTNAME_PREFIX       hostname prefix; default: "ct-" (LXC) / "vm-" (VM)
-#   TS_EXTRA_ARGS            extra flags appended to every `tailscale up`
-#   MULLVAD_LAN_AUTODETECT   1 (default) = auto-allow each guest's own LAN subnet(s)
-#   MULLVAD_LAN_INCLUDE_GUESTS 1 (default) = also allow every other running
-#                            guest's LAN subnet(s) on the node, so containers,
-#                            VMs, and LXCs stay reachable to each other on the LAN
-#   MULLVAD_LAN_SUBNET       extra subnet(s) to always allow (space/comma sep); default: none
-#   MULLVAD_COUNTRY_FILTER   limit rotation to a country (e.g. "USA"); default: any
-#   PVE_NODE                 Proxmox node to scan; default: `hostname -s`
-#   SELECT_GUESTS            space/comma-separated vmids to deploy to; default:
-#                            unset. When unset and a terminal is attached, an
-#                            interactive checklist (whiptail, or a numbered text
-#                            prompt fallback) lets you pick which running guests
-#                            get the kill-switch. When unset with no terminal
-#                            (cron/pipe), every running guest is selected.
-#   DRY_RUN                  1 = enumerate & classify only, change nothing
-#   FORCE_REDEPLOY           1 = re-push assets to every guest even if already
-#                            protected (use to roll out config/asset changes)
-#
-# Usage:  TS_AUTHKEY=tskey-... ./bulkvpn-deploy.sh [--help]
-# --------------------------------------------------------------------------
 
 set -Eeuo pipefail
 
@@ -73,7 +26,56 @@ LOG_FILE="/root/bulkvpn-$(date '+%Y%m%d-%H%M%S').log"
 SUCCESS=0; SKIPPED=0; FAILED=0
 SELECTED_IDS=""                         # space-separated vmids chosen for deploy
 
-usage() { sed -n '2,48p' "$0"; }
+usage() {
+cat <<'USAGE_EOF'
+bulkvpn-deploy.sh — bulk-deploy the Tailscale + Mullvad fail-closed
+kill-switch across every LXC container and VM on a Proxmox VE node.
+
+For each RUNNING guest it will, idempotently:
+  1. skip it if the kill-switch is already installed & scheduled,
+  2. skip it (with a warning) if the guest is not systemd-based,
+  3. install + enroll Tailscale if it isn't already on the tailnet,
+  4. verify a Mullvad exit node is available on the tailnet,
+  5. push in the kill-switch (nftables ruleset + rotate script + 3 systemd
+     units), enable the boot firewall, start the 15-minute self-heal timer,
+     and kick a first rotation so a verified exit node is selected.
+
+LXC guests are driven with `pct exec`; VMs via the QEMU guest agent
+(`qm guest exec`) — a VM therefore needs qemu-guest-agent installed & running.
+
+Run as root on the Proxmox host.
+
+Combines and builds on:
+  https://github.com/thelorax1775/tailscale-mullvad-killswitch
+  https://github.com/thelorax1775/TailAdjuster
+
+--------------------------------------------------------------------------
+Configuration (environment variables):
+  TS_AUTHKEY               (required) Tailscale auth key for enrollment
+  TS_LOGIN_SERVER          alt control server (e.g. Headscale); default: none
+  TS_HOSTNAME_PREFIX       hostname prefix; default: "ct-" (LXC) / "vm-" (VM)
+  TS_EXTRA_ARGS            extra flags appended to every `tailscale up`
+  MULLVAD_LAN_AUTODETECT   1 (default) = auto-allow each guest's own LAN subnet(s)
+  MULLVAD_LAN_INCLUDE_GUESTS 1 (default) = also allow every other running
+                           guest's LAN subnet(s) on the node, so containers,
+                           VMs, and LXCs stay reachable to each other on the LAN
+  MULLVAD_LAN_SUBNET       extra subnet(s) to always allow (space/comma sep); default: none
+  MULLVAD_COUNTRY_FILTER   limit rotation to a country (e.g. "USA"); default: any
+  PVE_NODE                 Proxmox node to scan; default: `hostname -s`
+  SELECT_GUESTS            space/comma-separated vmids to deploy to; default:
+                           unset. When unset and a terminal is attached, an
+                           interactive checklist (whiptail, or a numbered text
+                           prompt fallback) lets you pick which running guests
+                           get the kill-switch. When unset with no terminal
+                           (cron/pipe), every running guest is selected.
+  DRY_RUN                  1 = enumerate & classify only, change nothing
+  FORCE_REDEPLOY           1 = re-push assets to every guest even if already
+                           protected (use to roll out config/asset changes)
+
+Usage:  TS_AUTHKEY=tskey-... ./bulkvpn-deploy.sh [--help]
+--------------------------------------------------------------------------
+USAGE_EOF
+}
 [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage; exit 0; }
 
 # Output is mirrored to a timestamped log from inside main(), *after* the guest
