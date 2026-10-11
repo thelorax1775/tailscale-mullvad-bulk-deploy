@@ -558,14 +558,14 @@ ts_classify() {
     fi
 }
 
-guest_reboot() {   # engine id
+guest_reboot() {
     case "$1" in
         lxc) pct reboot "$2" >/dev/null 2>&1 || true; wait_for_lxc_ready "$2" ;;
         vm)  qm reboot "$2" >/dev/null 2>&1 || true; wait_for_vm_agent "$2" ;;
     esac
 }
 
-enroll_guest() {   # engine id label hostname install|enroll
+enroll_guest() {
     local engine="$1" id="$2" label="$3" host="$4" action="$5"
 
     if [[ -z "$TS_AUTHKEY" ]]; then
@@ -596,7 +596,7 @@ enroll_guest() {   # engine id label hostname install|enroll
     return 0
 }
 
-skip_guest() {   # label reason
+skip_guest() {
     if $DRY; then
         log "  [$1] WOULD skip — $2"
     else
@@ -605,7 +605,7 @@ skip_guest() {   # label reason
     inc SKIPPED
 }
 
-dry_enroll_report() {   # engine id label hostname install|enroll
+dry_enroll_report() {
     local engine="$1" id="$2" label="$3" host="$4" action="$5" steps=""
     if [[ -z "$TS_AUTHKEY" ]]; then
         log "  [$label] WOULD fail — guest needs Tailscale enrollment but TS_AUTHKEY is not set"
@@ -620,7 +620,7 @@ dry_enroll_report() {   # engine id label hostname install|enroll
     inc WOULD_ENROLL
 }
 
-process_guest() {   # engine id name
+process_guest() {
     local engine="$1" vmid="$2" name="$3" kind label host probe verdict action reason
     if [[ "$engine" == "lxc" ]]; then
         kind="LXC"; label="ct/${vmid} (${name})"
