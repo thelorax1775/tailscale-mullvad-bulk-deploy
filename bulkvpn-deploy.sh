@@ -16,6 +16,7 @@ MULLVAD_LAN_SUBNET="${MULLVAD_LAN_SUBNET:-}"            # extra subnet(s) to alw
 MULLVAD_LAN_SCAN_EXCLUDE="${MULLVAD_LAN_SCAN_EXCLUDE:-}"
 MULLVAD_LAN_AGENT_QUERY="${MULLVAD_LAN_AGENT_QUERY:-1}"
 MULLVAD_COUNTRY_FILTER="${MULLVAD_COUNTRY_FILTER:-}"
+MULLVAD_PREFERRED_NODE="${MULLVAD_PREFERRED_NODE:-}"
 PVE_NODE="${PVE_NODE:-$(hostname -s)}"
 SELECT_GUESTS="${SELECT_GUESTS:-}"      # space/comma vmids to deploy to; empty = menu (TTY) or all (no TTY)
 DRY_RUN="${DRY_RUN:-0}"
@@ -83,6 +84,10 @@ Configuration (environment variables):
                            read-only); 0 = host-side config only
   MULLVAD_LAN_SUBNET       extra subnet(s) to always allow (space/comma sep); default: none
   MULLVAD_COUNTRY_FILTER   limit rotation to a country (e.g. "USA"); default: any
+  MULLVAD_PREFERRED_NODE   exit node to prefer and return to, e.g.
+                           us-bos-wg-001.mullvad.ts.net; on failure rotation falls
+                           back within MULLVAD_COUNTRY_FILTER, and each --check-only
+                           run moves back once it works again; default: none
   PVE_NODE                 Proxmox node to scan; default: `hostname -s`
   SELECT_GUESTS            space/comma-separated vmids to deploy to; default:
                            unset. When unset and a terminal is attached, an
@@ -133,6 +138,7 @@ set -euo pipefail
 
 ### ---- Configuration -------------------------------------------------------
 COUNTRY_FILTER=""              # e.g. "USA"; empty = any country
+PREFERRED_NODE=""
 ALLOW_LAN=true                 # keep LAN access to the web UI / SSH
 LAN_SUBNETS=""                 # space-separated CIDRs to keep reachable directly
                                # (off the exit-node tunnel), e.g. other guests' LANs
@@ -186,12 +192,46 @@ verify_connectivity() {
     return 1
 }
 
+
+CURRENT=""
+if command -v jq >/dev/null 2>&1; then
+    CURRENT="$("$TAILSCALE" status --json 2>/dev/null \
+        | jq -r '.. | objects | select(.ExitNode? == true) | .DNSName? // empty' \
+        | sed 's/\.$//' | head -n1)"
+fi
+
+switch_to() {
+    local target="$1"
+    if [[ "$target" == "$CURRENT" ]]; then
+        "$TAILSCALE" set --exit-node= || true
+    fi
+    "$TAILSCALE" set --exit-node="$target" --exit-node-allow-lan-access="$ALLOW_LAN" || return 1
+    sleep "$TUNNEL_SETTLE"
+    verify_connectivity && return 0
+    sleep "$TUNNEL_SETTLE"
+    verify_connectivity
+}
+
 if $CHECK_ONLY; then
     if verify_connectivity; then
-        log "check-only: tunnel healthy, no action"
-        exit 0
+        if [[ -z "$PREFERRED_NODE" || "$CURRENT" == "$PREFERRED_NODE" ]]; then
+            log "check-only: tunnel healthy, no action"
+            exit 0
+        fi
+        log "check-only: healthy on ${CURRENT:-none}, trying preferred $PREFERRED_NODE"
+        if switch_to "$PREFERRED_NODE"; then
+            log "OK: back on preferred $PREFERRED_NODE"
+            exit 0
+        fi
+        log "WARN: preferred $PREFERRED_NODE not working, returning to ${CURRENT:-a fallback}"
+        if [[ -n "$CURRENT" ]] && switch_to "$CURRENT"; then
+            log "OK: staying on fallback $CURRENT"
+            exit 0
+        fi
+        log "check-only: fallback lost too — acquiring a new node"
+    else
+        log "check-only: NO connectivity detected — acquiring a new node"
     fi
-    log "check-only: NO connectivity detected — acquiring a new node"
 fi
 
 list_cmd=("$TAILSCALE" exit-node list)
@@ -204,27 +244,19 @@ mapfile -t NODES < <(
 )
 (( ${#NODES[@]} > 0 )) || die "no online Mullvad exit nodes found${COUNTRY_FILTER:+ for '$COUNTRY_FILTER'}"
 
-CURRENT=""
-if command -v jq >/dev/null 2>&1; then
-    CURRENT="$("$TAILSCALE" status --json 2>/dev/null \
-        | jq -r '.. | objects | select(.ExitNode? == true) | .DNSName? // empty' \
-        | sed 's/\.$//' | head -n1)"
-fi
 
-mapfile -t ORDER < <(printf '%s\n' "${NODES[@]}" | grep -vxF "${CURRENT:-__none__}" | shuf)
-[[ -n "$CURRENT" ]] && ORDER+=("$CURRENT")
+mapfile -t ORDER < <(printf '%s\n' "${NODES[@]}" | grep -vxF -e "${CURRENT:-__none__}" -e "${PREFERRED_NODE:-__none__}" | shuf)
+if [[ -n "$PREFERRED_NODE" ]] && { [[ "$CURRENT" == "$PREFERRED_NODE" ]] || printf '%s\n' "${NODES[@]}" | grep -qxF "$PREFERRED_NODE"; }; then
+    ORDER=("$PREFERRED_NODE" "${ORDER[@]}")
+fi
+[[ -n "$CURRENT" && "$CURRENT" != "$PREFERRED_NODE" ]] && ORDER+=("$CURRENT")
 
 LABEL=""; $CHECK_ONLY && LABEL="[heal] "
 log "${LABEL}Selecting from ${#NODES[@]} candidates (current: ${CURRENT:-none})"
 
 for TARGET in "${ORDER[@]}"; do
     log "Trying $TARGET ..."
-    if ! "$TAILSCALE" set --exit-node="$TARGET" --exit-node-allow-lan-access="$ALLOW_LAN"; then
-        log "WARN: could not set $TARGET, trying next"
-        continue
-    fi
-    sleep "$TUNNEL_SETTLE"
-    if verify_connectivity; then
+    if switch_to "$TARGET"; then
         log "OK: traffic verified through $TARGET"
         exit 0
     fi
@@ -327,6 +359,7 @@ HT_EOF
 rotate_templated() {   # $1 = space-separated LAN subnets to keep off the tunnel
     asset_rotate \
         | sed "s|^COUNTRY_FILTER=.*|COUNTRY_FILTER=\"${MULLVAD_COUNTRY_FILTER}\"|" \
+        | sed "s|^PREFERRED_NODE=.*|PREFERRED_NODE=\"${MULLVAD_PREFERRED_NODE}\"|" \
         | sed "s|^LAN_SUBNETS=.*|LAN_SUBNETS=\"${1}\"|"
 }
 nft_templated() {   # $1 = LAN value for the nft `define LAN` line (e.g. "{ 192.168.1.0/24 }")
