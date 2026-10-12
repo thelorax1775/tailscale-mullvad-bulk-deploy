@@ -84,6 +84,11 @@ TS_AUTHKEY=tskey-... \
   MULLVAD_LAN_SUBNET=10.0.10.0/24 \
   ./bulkvpn-deploy.sh
 
+TS_AUTHKEY=tskey-... \
+  MULLVAD_COUNTRY_FILTER=USA \
+  MULLVAD_PREFERRED_NODE=us-bos-wg-001.mullvad.ts.net \
+  ./bulkvpn-deploy.sh
+
 # re-run on the same node to roll out an updated ruleset / config to guests
 # that were already protected by an earlier run
 FORCE_REDEPLOY=1 TS_AUTHKEY=tskey-... ./bulkvpn-deploy.sh
@@ -173,6 +178,7 @@ By default each guest's own LAN subnet is **auto-detected and kept reachable**, 
 | `MULLVAD_LAN_AGENT_QUERY` | `1` | `1` = in the pre-scan, also ask the QEMU guest agent of **selected** VMs for their addresses (read-only `network-get-interfaces`). `0` = host-side config only. Unselected VMs are never queried either way. |
 | `MULLVAD_LAN_SUBNET` | *(none)* | Extra subnet(s) to always allow, on top of auto-detect (space/comma separated) |
 | `MULLVAD_COUNTRY_FILTER` | *(any)* | Restrict exit-node rotation to a country (e.g. `USA`) |
+| `MULLVAD_PREFERRED_NODE` | *(none)* | Exit node to prefer and return to, e.g. `us-bos-wg-001.mullvad.ts.net`. Rotation tries it first; if it fails, it falls back to another node within `MULLVAD_COUNTRY_FILTER`, and every `--check-only` heal moves the guest back once the preferred node works again. A rotation while already on it stays on it. |
 | `PVE_NODE` | `hostname -s` | Proxmox node to scan |
 | `SELECT_GUESTS` | *(unset)* | Space/comma-separated vmids to deploy to. Unset + a terminal → an interactive checklist to pick running guests; unset + no terminal (cron/pipe) → every running guest (the historical default). |
 | `DRY_RUN` | `0` | `1` = change nothing; run the same read-only checks as a real run and report `WOULD deploy` / `WOULD enroll` / `WOULD skip` / `WOULD fail` per guest (see [Dry run](#dry-run)) |

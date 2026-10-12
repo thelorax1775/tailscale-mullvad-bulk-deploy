@@ -66,6 +66,17 @@
 
 ### Added
 
+- `MULLVAD_PREFERRED_NODE`: an exit node the rotator prefers and returns to.
+  Rotation tries it first (even when it is already the current node, which the
+  tailnet's exit-node list omits); on failure it falls back within
+  `MULLVAD_COUNTRY_FILTER`, and each `--check-only` heal moves back to it once
+  it works again. Switching to the node already in use clears and re-sets the
+  exit node to force a fresh WireGuard handshake, which recovers tunnels left
+  stuck after an upstream network change. Connectivity is re-checked once
+  before a node is declared dead, so a slow handshake is not mistaken for a
+  failure. Applied to both `assets/mullvad-rotate.sh` and the copy embedded in
+  `bulkvpn-deploy.sh`.
+
 - `MULLVAD_LAN_SCAN_EXCLUDE`: vmids to leave out of the LAN pre-scan.
 - `MULLVAD_LAN_AGENT_QUERY` (default `1`): set `0` to keep the pre-scan to
   host-side config only, with no guest-agent queries even for selected VMs.

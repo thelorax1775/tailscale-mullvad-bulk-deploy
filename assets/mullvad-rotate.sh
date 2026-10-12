@@ -23,6 +23,7 @@ set -euo pipefail
 
 ### ---- Configuration -------------------------------------------------------
 COUNTRY_FILTER=""              # e.g. "USA"; empty = any country
+PREFERRED_NODE=""
 ALLOW_LAN=true                 # keep LAN access to the web UI / SSH
 LAN_SUBNETS=""                 # space-separated CIDRs to keep reachable directly
                                # (off the exit-node tunnel), e.g. other guests' LANs
@@ -78,13 +79,46 @@ verify_connectivity() {
     return 1
 }
 
-# --check-only: bail out early if the tunnel is already healthy.
+
+CURRENT=""
+if command -v jq >/dev/null 2>&1; then
+    CURRENT="$("$TAILSCALE" status --json 2>/dev/null \
+        | jq -r '.. | objects | select(.ExitNode? == true) | .DNSName? // empty' \
+        | sed 's/\.$//' | head -n1)"
+fi
+
+switch_to() {
+    local target="$1"
+    if [[ "$target" == "$CURRENT" ]]; then
+        "$TAILSCALE" set --exit-node= || true
+    fi
+    "$TAILSCALE" set --exit-node="$target" --exit-node-allow-lan-access="$ALLOW_LAN" || return 1
+    sleep "$TUNNEL_SETTLE"
+    verify_connectivity && return 0
+    sleep "$TUNNEL_SETTLE"
+    verify_connectivity
+}
+
 if $CHECK_ONLY; then
     if verify_connectivity; then
-        log "check-only: tunnel healthy, no action"
-        exit 0
+        if [[ -z "$PREFERRED_NODE" || "$CURRENT" == "$PREFERRED_NODE" ]]; then
+            log "check-only: tunnel healthy, no action"
+            exit 0
+        fi
+        log "check-only: healthy on ${CURRENT:-none}, trying preferred $PREFERRED_NODE"
+        if switch_to "$PREFERRED_NODE"; then
+            log "OK: back on preferred $PREFERRED_NODE"
+            exit 0
+        fi
+        log "WARN: preferred $PREFERRED_NODE not working, returning to ${CURRENT:-a fallback}"
+        if [[ -n "$CURRENT" ]] && switch_to "$CURRENT"; then
+            log "OK: staying on fallback $CURRENT"
+            exit 0
+        fi
+        log "check-only: fallback lost too — acquiring a new node"
+    else
+        log "check-only: NO connectivity detected — acquiring a new node"
     fi
-    log "check-only: NO connectivity detected — acquiring a new node"
 fi
 
 # Gather online Mullvad candidates.
@@ -98,30 +132,19 @@ mapfile -t NODES < <(
 )
 (( ${#NODES[@]} > 0 )) || die "no online Mullvad exit nodes found${COUNTRY_FILTER:+ for '$COUNTRY_FILTER'}"
 
-# Current node (best-effort, used to deprioritise it so rotation changes nodes).
-CURRENT=""
-if command -v jq >/dev/null 2>&1; then
-    CURRENT="$("$TAILSCALE" status --json 2>/dev/null \
-        | jq -r '.. | objects | select(.ExitNode? == true) | .DNSName? // empty' \
-        | sed 's/\.$//' | head -n1)"
-fi
 
-# Random order, with the current node placed last (so a normal rotation
-# changes nodes when possible, but it's still available as a fallback).
-mapfile -t ORDER < <(printf '%s\n' "${NODES[@]}" | grep -vxF "${CURRENT:-__none__}" | shuf)
-[[ -n "$CURRENT" ]] && ORDER+=("$CURRENT")
+mapfile -t ORDER < <(printf '%s\n' "${NODES[@]}" | grep -vxF -e "${CURRENT:-__none__}" -e "${PREFERRED_NODE:-__none__}" | shuf)
+if [[ -n "$PREFERRED_NODE" ]] && { [[ "$CURRENT" == "$PREFERRED_NODE" ]] || printf '%s\n' "${NODES[@]}" | grep -qxF "$PREFERRED_NODE"; }; then
+    ORDER=("$PREFERRED_NODE" "${ORDER[@]}")
+fi
+[[ -n "$CURRENT" && "$CURRENT" != "$PREFERRED_NODE" ]] && ORDER+=("$CURRENT")
 
 LABEL=""; $CHECK_ONLY && LABEL="[heal] "
 log "${LABEL}Selecting from ${#NODES[@]} candidates (current: ${CURRENT:-none})"
 
 for TARGET in "${ORDER[@]}"; do
     log "Trying $TARGET ..."
-    if ! "$TAILSCALE" set --exit-node="$TARGET" --exit-node-allow-lan-access="$ALLOW_LAN"; then
-        log "WARN: could not set $TARGET, trying next"
-        continue
-    fi
-    sleep "$TUNNEL_SETTLE"
-    if verify_connectivity; then
+    if switch_to "$TARGET"; then
         log "OK: traffic verified through $TARGET"
         exit 0
     fi
