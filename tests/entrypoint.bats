@@ -36,6 +36,7 @@ setup() {
 }
 
 @test "BULKVPN_LIB_ONLY=1 defines the functions and does not run main" {
+    # shellcheck disable=SC2016  # single quotes intentional: snippet is expanded by the inner bash
     run env BULKVPN_LIB_ONLY=1 PATH="$NOTOOLS_PATH" "$BASH" -c 'source "$0"; declare -F main process_guest ts_classify' "$SCRIPT"
     [ "$status" -eq 0 ]
     [[ "$output" != *"FATAL"* ]]
@@ -43,11 +44,13 @@ setup() {
 }
 
 @test "BULKVPN_LOG_DIR decides where the log goes" {
+    # shellcheck disable=SC2016  # single quotes intentional: snippet is expanded by the inner bash
     run env BULKVPN_LIB_ONLY=1 "$BASH" -c 'source "$0"; echo "$LOG_FILE"' "$SCRIPT"
     [[ "$output" == "$BATS_TEST_TMPDIR/logs/bulkvpn-"*.log ]]
 }
 
 @test "without BULKVPN_LOG_DIR the log still goes to /root" {
+    # shellcheck disable=SC2016  # single quotes intentional: snippet is expanded by the inner bash
     run env -u BULKVPN_LOG_DIR BULKVPN_LIB_ONLY=1 "$BASH" -c 'source "$0"; echo "$LOG_FILE"' "$SCRIPT"
     [[ "$output" == /root/bulkvpn-*.log ]]
 }

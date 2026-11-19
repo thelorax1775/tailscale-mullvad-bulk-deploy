@@ -26,8 +26,8 @@ mapfile -t SH_FILES < <(
       find tests -type f \( -name '*.sh' -o -name '*.bash' -o -name '*.bats' \) | sort
     } | sort -u
 )
-# ShellCheck does not know bats syntax, so .bats files get bash -n only via bats.
-mapfile -t LINT_FILES < <(printf '%s\n' "${SH_FILES[@]}" | grep -v '\.bats$')
+# ShellCheck reads .bats files natively; only bash -n skips them (bats parses them itself).
+LINT_FILES=("${SH_FILES[@]}")
 
 step "bash -n (${#SH_FILES[@]} files)"
 for f in "${SH_FILES[@]}"; do

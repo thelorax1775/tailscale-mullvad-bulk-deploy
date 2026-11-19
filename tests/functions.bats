@@ -185,6 +185,7 @@ IN
     stub_setup
     fixture_lxc '[{"vmid":100,"status":"running","name":"web"},{"vmid":101,"status":"stopped","name":"old"}]'
     fixture_qemu '[{"vmid":200,"status":"running","name":"vm"}]'
+    # shellcheck disable=SC2016  # single quotes intentional: snippet is expanded by the inner bash
     SELECT_GUESTS="100,101 999" run libsh 'select_guests; echo "SELECTED=[$SELECTED_IDS]"'
     [ "$status" -eq 0 ]
     [[ "$output" == *"SELECTED=[100]"* ]]
@@ -196,6 +197,7 @@ IN
     stub_setup
     fixture_lxc '[{"vmid":100,"status":"running","name":"web"}]'
     fixture_qemu '[{"vmid":200,"status":"running","name":"vm"}]'
+    # shellcheck disable=SC2016  # single quotes intentional: snippet is expanded by the inner bash
     SELECT_GUESTS="200 100 200" run libsh 'select_guests; echo "SELECTED=[$SELECTED_IDS]"'
     [[ "$output" == *"SELECTED=[100 200]"* ]]
 }

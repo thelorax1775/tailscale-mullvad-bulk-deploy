@@ -35,7 +35,7 @@ stray_files() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"Done (dry run, nothing changed).  WOULD_DEPLOY=1  WOULD_ENROLL=0  WOULD_FAIL=0  SKIPPED=2  FAILED=0"* ]]
     [[ "$output" == *"[ct/101 (web)] WOULD deploy"* ]]
-    [[ "$output" == *"ct/102 (old)) SKIP — not running"* || "$output" == *"ct/102 (old) SKIP — not running"* ]]
+    [[ "$output" == *"ct/102 (old) SKIP — not running"* ]]
     [[ "$output" == *"WOULD skip — qemu-guest-agent not responding"* ]]
 
     run calls_log
