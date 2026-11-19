@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Added
+
+- Automatic checks. `./check.sh` runs `bash -n`, ShellCheck, a bats suite and a
+  network-namespace leak rig; `.github/workflows/ci.yml` runs it as job `ci` on
+  every pull request and every push to `main`. The bats suite covers the helper
+  functions, `ts_classify`, guest selection, end-to-end dry and real runs
+  against stub `pvesh`/`pct`/`qm`, and a drift test for the embedded assets. The
+  leak rig loads the real templated ruleset and checks that nothing reaches the
+  physical NIC while the tunnel is down.
+- Test seams (no effect when unset): `BULKVPN_LIB_ONLY=1` defines the functions
+  without running `main`; `BULKVPN_LOG_DIR` sets the log directory (default
+  `/root`).
+
+### Changed (checks)
+
+- The assets embedded in `bulkvpn-deploy.sh` are now byte-identical to
+  `assets/` (the comments that had been stripped are back), as the README says;
+  `tests/assets.bats` enforces it.
+- Two ShellCheck notes are silenced per line with a reason (SC2016 in
+  `assets/mullvad-rotate.sh`, SC2086 in `select_guests`).
+
 ### Changed
 
 - The Tailscale auth key no longer appears on any command line. It used to be

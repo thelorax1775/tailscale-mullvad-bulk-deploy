@@ -208,6 +208,13 @@ Every run writes a timestamped log to `/root/bulkvpn-<timestamp>.log` and prints
 
 ```
 bulkvpn-deploy.sh              # main script — run as root on the Proxmox host
+check.sh                       # runs every automatic check (what CI runs)
+.github/workflows/ci.yml       # CI: one job, `ci`, runs ./check.sh
+tests/
+  helpers.bash                 # shared bats helpers
+  stubs/pve-stub.sh            # fake pvesh / pct / qm used by the tests
+  *.bats                       # unit, drift and end-to-end tests
+  leak/run.sh                  # network-namespace leak test of the kill-switch
 assets/
   mullvad-rotate.sh            # → /usr/local/bin/ in each guest
   nftables/mullvad-killswitch.nft
@@ -217,7 +224,19 @@ assets/
     mullvad-healthcheck.timer
 ```
 
-The `assets/` files are the single source of truth (vendored from the upstream kill-switch repo, with the LAN-subnet templating, LAN-bypass and forward-chain additions described above). `bulkvpn-deploy.sh` embeds identical copies inline so it can provision guests without fetching anything — handy since the kill-switch itself blocks egress. If you edit an asset, mirror the change into the matching `asset_*()` heredoc in the script.
+The `assets/` files are the single source of truth (vendored from the upstream kill-switch repo, with the LAN-subnet templating, LAN-bypass and forward-chain additions described above). `bulkvpn-deploy.sh` embeds byte-identical copies inline (comments included) so it can provision guests without fetching anything — handy since the kill-switch itself blocks egress. `tests/assets.bats` fails if any embedded copy differs from its file by even one character. If you edit an asset, mirror the change into the matching `asset_*()` heredoc in the script.
+
+## Running the checks
+
+```bash
+./check.sh
+```
+
+It runs, in order, and stops with a non-zero exit at the first failure: `bash -n` on every shell file; ShellCheck (default severity); the [bats](https://github.com/bats-core/bats-core) suite (unit tests, the asset drift test and end-to-end runs against stub `pvesh`/`pct`/`qm`, using temp directories only, never a real Proxmox node); and the leak rig, which loads the real templated nftables ruleset into throwaway network namespaces and counts which packets reach the "physical" side.
+
+Needs `bash`, `shellcheck`, `bats`, `jq`, `nft`, `ip`, `unshare` and `python3`. The leak rig runs without root through unprivileged user namespaces, or as root (directly or via passwordless `sudo`). If it cannot create namespaces it is skipped with a message, except when `CI=true`, where that is a failure. The same script runs on every pull request and every push to `main` through `.github/workflows/ci.yml`.
+
+For testing, `BULKVPN_LIB_ONLY=1` makes the script define its functions and return without running `main`, and `BULKVPN_LOG_DIR` moves the log directory away from `/root`. Neither changes anything when unset.
 
 ## Removing the kill-switch from individual guests
 
@@ -325,7 +344,7 @@ the interactive menu, or list only the guests you *do* want via `SELECT_GUESTS`
 
 ## Project status
 
-Working tool, last changed in four merged PRs (LAN auto-detect, cross-guest LAN reachability, `FORCE_REDEPLOY`, guest picker). There is no test suite or CI; behaviour described here comes from reading the script and has not been re-verified on a live Proxmox node for this README. Compared with tailscale-bulk-join, this script does not fail fast on a rejected auth key (it reboots the guest and retries the join once), and installs prerequisites only via apt, dnf or yum (Alpine is skipped anyway as non-systemd), so a plain Tailscale-only rollout is still better served by that repo.
+Working tool, last changed in seven merged PRs (LAN auto-detect, cross-guest LAN reachability, `FORCE_REDEPLOY`, guest picker, safe re-runs, repo cleanup, `MULLVAD_PREFERRED_NODE`). It now has tests and CI: ShellCheck, a bats suite with stub Proxmox tools, an asset drift check and a network-namespace leak rig run on every pull request (see [Running the checks](#running-the-checks)). The tests have not been run against a live Proxmox node; that behaviour still comes from reading the script. Compared with tailscale-bulk-join, this script does not fail fast on a rejected auth key (it reboots the guest and retries the join once), and installs prerequisites only via apt, dnf or yum (Alpine is skipped anyway as non-systemd), so a plain Tailscale-only rollout is still better served by that repo.
 
 ## Credits & license
 
