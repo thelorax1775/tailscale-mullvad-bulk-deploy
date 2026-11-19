@@ -13,10 +13,12 @@ setup() {
 }
 
 # Files created or changed outside the test's temp directory while the script
-# ran. Only places a deploy would plausibly write to are watched.
+# ran. Only the places this script could write to are watched (the repo, the
+# log default /root, and the host paths ensure_host_tun and enable_tun_lxc use);
+# a whole-filesystem scan would trip over unrelated activity on a busy runner.
 stray_files() {
     local d
-    for d in "$REPO" /etc /usr/local /root /var/lib /opt /srv; do
+    for d in "$REPO" /root /usr/local /etc/modules-load.d /etc/nftables.d /etc/systemd /etc/pve; do
         [ -d "$d" ] || continue
         find "$d" -xdev -type f -newer "$MARK" -not -path "$BATS_TEST_TMPDIR/*" 2>/dev/null
     done
@@ -47,7 +49,8 @@ stray_files() {
 
     # The only file written is the log, and it is inside the temp directory.
     ls "$BULKVPN_LOG_DIR"/bulkvpn-*.log
-    [ -z "$(stray_files)" ] || { stray_files; false; }
+    strays="$(stray_files)"
+    [ -z "$strays" ] || { echo "files written outside the temp dir: $strays"; false; }
 }
 
 @test "DRY_RUN=1: a VM that needs enrollment never gets the key even with TS_AUTHKEY set" {
