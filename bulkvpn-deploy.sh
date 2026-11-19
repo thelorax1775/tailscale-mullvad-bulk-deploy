@@ -25,7 +25,8 @@ FORCE_REDEPLOY="${FORCE_REDEPLOY:-0}"   # 1 = re-push to already-protected guest
 LXC_READY_TIMEOUT="${LXC_READY_TIMEOUT:-30}"
 VM_AGENT_TIMEOUT="${VM_AGENT_TIMEOUT:-90}"
 VM_EXEC_TIMEOUT="${VM_EXEC_TIMEOUT:-180}"
-LOG_FILE="/root/bulkvpn-$(date '+%Y%m%d-%H%M%S').log"
+# BULKVPN_LOG_DIR is a test seam: the checks point it at a temp directory.
+LOG_FILE="${BULKVPN_LOG_DIR:-/root}/bulkvpn-$(date '+%Y%m%d-%H%M%S').log"
 ### --------------------------------------------------------------------------
 
 SUCCESS=0; SKIPPED=0; FAILED=0
@@ -124,15 +125,32 @@ DRY=false;   [[ "$DRY_RUN" == "1" ]] && DRY=true
 FORCE=false; [[ "$FORCE_REDEPLOY" == "1" ]] && FORCE=true
 
 ### ---- Embedded kill-switch assets ----------------------------------------
-# Single source of truth lives in assets/; these heredocs are kept identical
-# so the host can provision guests that have no working egress yet.
+# Single source of truth lives in assets/; these heredocs are byte-identical
+# copies (tests/assets.bats fails on any drift) so the host can provision
+# guests that have no working egress yet.
 
 asset_rotate() {
 cat <<'ROTATE_EOF'
 #!/usr/bin/env bash
 #
 # mullvad-rotate.sh — rotate / self-heal the Tailscale + Mullvad exit node.
-# Vendored by bulkvpn from tailscale-mullvad-killswitch.
+#
+# Normal run     : picks a fresh random ONLINE node, switches, and VERIFIES
+#                  that traffic actually flows through it. If verification
+#                  fails it transparently re-acquires another node, looping
+#                  until one works or candidates are exhausted.
+# --check-only   : does nothing if the current tunnel is healthy; only
+#                  re-acquires when connectivity is down. Run this on a short
+#                  timer as a self-healing watchdog.
+#
+# Leak safety comes from the companion nftables kill-switch
+# (mullvad-killswitch.nft): whenever no working exit node is set, all
+# non-tunnel egress is DROPPED, so a failed/unverified node never leaks
+# your real IP.
+#
+# Vendored from https://github.com/thelorax1775/tailscale-mullvad-killswitch
+# The COUNTRY_FILTER / ALLOW_LAN / LAN_SUBNETS lines below are templated by
+# bulkvpn-deploy.sh.
 
 set -euo pipefail
 
@@ -183,6 +201,8 @@ ensure_lan_bypass() {
 ensure_lan_bypass
 
 verify_connectivity() {
+    # With the kill-switch active, ANY successful outbound TCP connect proves
+    # traffic is egressing through the tunnel (raw eth0 egress is dropped).
     local host
     for host in 1.1.1.1 9.9.9.9; do
         if timeout "$CHECK_TIMEOUT" bash -c "exec 3<>/dev/tcp/${host}/443" 2>/dev/null; then
@@ -234,6 +254,7 @@ if $CHECK_ONLY; then
     fi
 fi
 
+# Gather online Mullvad candidates.
 list_cmd=("$TAILSCALE" exit-node list)
 [[ -n "$COUNTRY_FILTER" ]] && list_cmd+=(--filter="$COUNTRY_FILTER")
 
@@ -242,6 +263,9 @@ mapfile -t NODES < <(
         | awk '/mullvad\.ts\.net/ && tolower($0) !~ /offline/ { print $2 }' \
         | sort -u
 )
+# The single quotes are literal text inside a double-quoted string, so
+# $COUNTRY_FILTER does expand: ShellCheck's SC2016 is a false positive here.
+# shellcheck disable=SC2016
 (( ${#NODES[@]} > 0 )) || die "no online Mullvad exit nodes found${COUNTRY_FILTER:+ for '$COUNTRY_FILTER'}"
 
 
@@ -263,6 +287,7 @@ for TARGET in "${ORDER[@]}"; do
     log "WARN: $TARGET set but no connectivity — re-acquiring"
 done
 
+# Nothing worked. The kill-switch keeps egress blocked, so this fails CLOSED.
 die "exhausted ${#NODES[@]} candidates with no working tunnel — egress remains blocked by kill-switch (no leak)"
 ROTATE_EOF
 }
@@ -270,7 +295,18 @@ ROTATE_EOF
 asset_nft() {
 cat <<'NFT_EOF'
 #!/usr/sbin/nft -f
-# mullvad-killswitch.nft — fail-closed egress firewall (vendored by bulkvpn).
+#
+# mullvad-killswitch.nft — fail-closed egress firewall for the Tailscale +
+# Mullvad exit-node setup.
+#
+# While a working exit node is up, app traffic egresses via tailscale0 and
+# tailscaled's encrypted underlay is allowed out the physical NIC. If the exit
+# node drops or is unset, EVERYTHING else is dropped — your real IP never leaks.
+#
+# Reload idempotently with:  nft -f /etc/nftables.d/mullvad-killswitch.nft
+#
+# Adjust LAN to match your local subnet if it isn't 192.168.1.0/24.
+# (bulkvpn-deploy.sh templates this line from MULLVAD_LAN_SUBNET.)
 
 define LAN = 192.168.1.0/24
 
@@ -280,16 +316,26 @@ table inet mullvad_killswitch {
     chain output {
         type filter hook output priority 0; policy drop;
 
+        # Loopback and already-established/related flows.
         oif "lo" accept
         ct state established,related accept
 
+        # App traffic that has been routed into the Tailscale tunnel.
         oifname "tailscale0" accept
 
+        # Tailscale's own encrypted underlay (WireGuard/DERP) carries the
+        # bypass mark 0x80000, so it isn't re-routed into the tunnel. Allow it,
+        # otherwise tailscaled can't reach the exit node at all.
         meta mark and 0xff0000 == 0x80000 accept
 
+        # Local network: keep the qBittorrent web UI / SSH reachable from LAN.
         ip daddr $LAN accept
 
+        # DHCP renew (harmless if you use a static IP).
         udp dport 67 accept
+
+        # Everything else — raw internet egress over the physical NIC — is
+        # dropped by the chain policy. That is the leak protection.
     }
 
     chain forward {
@@ -782,6 +828,8 @@ select_guests() {
                 log "WARN: SELECT_GUESTS id '$tok' is not a running guest on '$PVE_NODE' — ignoring"
             fi
         done
+        # Word splitting is wanted: one vmid per line for sort.
+        # shellcheck disable=SC2086
         SELECTED_IDS="$(printf '%s\n' $SELECTED_IDS | sort -un | paste -sd' ' -)"
         [[ -n "$SELECTED_IDS" ]] || die "SELECT_GUESTS matched no running guests"
         return 0
@@ -830,6 +878,8 @@ select_guests() {
             log "WARN: '$tok' is neither a listed number nor a running vmid — ignoring"
         fi
     done
+    # Word splitting is wanted: one vmid per line for sort.
+    # shellcheck disable=SC2086
     SELECTED_IDS="$(printf '%s\n' $SELECTED_IDS | sort -un | paste -sd' ' -)"
     [[ -n "$SELECTED_IDS" ]] || { log "No valid guests selected — nothing deployed."; exit 0; }
 }
@@ -1003,4 +1053,10 @@ main() {
     (( FAILED == 0 ))
 }
 
-main "$@"
+# Test seam: with BULKVPN_LIB_ONLY=1 the script only defines its functions and
+# stops here, so the checks (./check.sh) can source it without running a deploy.
+# main stays in the body of the `if` (not behind `||`) so `set -e` still applies
+# inside it exactly as before.
+if [[ "${BULKVPN_LIB_ONLY:-}" != "1" ]]; then
+    main "$@"
+fi

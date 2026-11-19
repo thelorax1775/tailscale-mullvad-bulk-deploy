@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install what is missing
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nftables bats shellcheck jq iproute2 python3
+
+      - name: Tool versions
+        run: |
+          shellcheck --version | sed -n 2p
+          bats --version
+          nft --version
+
+      - name: Run ./check.sh
+        run: ./check.sh

@@ -130,6 +130,9 @@ mapfile -t NODES < <(
         | awk '/mullvad\.ts\.net/ && tolower($0) !~ /offline/ { print $2 }' \
         | sort -u
 )
+# The single quotes are literal text inside a double-quoted string, so
+# $COUNTRY_FILTER does expand: ShellCheck's SC2016 is a false positive here.
+# shellcheck disable=SC2016
 (( ${#NODES[@]} > 0 )) || die "no online Mullvad exit nodes found${COUNTRY_FILTER:+ for '$COUNTRY_FILTER'}"
 
 
