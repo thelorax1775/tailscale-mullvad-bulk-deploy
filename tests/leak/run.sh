@@ -488,6 +488,38 @@ if [[ "$out" == "pong:ping" ]]; then
 else
     result bad "tunnel down: a published port (LAN -> DNAT -> container) works and the replies come back" "got: ${out:-nothing}"
 fi
+# 2b. The answers to an INTERNET client of a published port go out the uplink,
+# not the tunnel: with the tunnel down they must be dropped (as on eth0). On a
+# br-* uplink the bridge-name accepts used to let them leave (client got a RST).
+c python3 -c "$INBOUND_SERVER" 172.17.0.2 &
+sp=$!
+sleep 0.5
+reset
+timeout 4 python3 -c 'import socket
+s = socket.create_connection(("192.168.50.2", 7100), timeout=2, source_address=("203.0.113.10", 0))' >/dev/null 2>&1
+sleep 0.3
+n="$(count phys_inet)"
+kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+if [[ "$n" == 0 ]]; then
+    result ok "tunnel down: replies to an internet client of a published port do not leave the uplink" "0 packets on the physical side"
+else
+    result bad "tunnel down: replies to an internet client of a published port do not leave the uplink" "LEAK: $n packets on the physical side"
+fi
+# 2c. Subnet router: a tunnel peer reaches a container IP directly (no DNAT)
+# while the tunnel is up.
+tunnel_up
+ip route add 172.17.0.0/24 via 100.64.0.2 dev wts 2>/dev/null
+c python3 -c "$INBOUND_SERVER" 172.17.0.2 &
+sp=$!
+sleep 0.5
+out="$(timeout 6 python3 -c "$INBOUND_CLIENT" 100.64.0.1 172.17.0.2 2>&1)"
+kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+if [[ "$out" == "pong:ping" ]]; then
+    result ok "tunnel up: a tunnel peer reaches a container IP directly (subnet router, no DNAT)" "ping answered with pong"
+else
+    result bad "tunnel up: a tunnel peer reaches a container IP directly (subnet router, no DNAT)" "got: ${out:-nothing}"
+fi
+tunnel_down
 # 3. Container to container on two bridges (docker0 and br-app), through the guest.
 g ip link add br-app type veth peer name c2veth netns C2 2>/dev/null || { ip netns add C2 && g ip link add br-app type veth peer name c2veth netns C2; } || broken "cannot create the second container bridge"
 g ip addr add 172.18.0.1/24 dev br-app

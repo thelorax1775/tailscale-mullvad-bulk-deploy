@@ -61,3 +61,12 @@ nft_check_lan() {   # SPACE-SEPARATED SUBNETS
     run grep -nE '^[[:space:]]*(ct state established|udp dport 67 accept)' "$REPO/assets/nftables/mullvad-killswitch.nft"
     [ "$status" -eq 1 ]
 }
+
+# nft 1.0.2 (Ubuntu 22.04) refuses the whole file ("Byteorder mismatch") when
+# a wildcard interface name ("br-*") sits inside an anonymous set { }. The file
+# loads as one atomic transaction, so that would disable the kill-switch there.
+# Use one rule (or jump) per name instead.
+@test "the kill-switch has no wildcard interface name inside an anonymous set (nft 1.0.2)" {
+    run grep -nE '(iifname|oifname)[[:space:]]*\{[^}]*\*' "$REPO/assets/nftables/mullvad-killswitch.nft"
+    [ "$status" -eq 1 ]
+}

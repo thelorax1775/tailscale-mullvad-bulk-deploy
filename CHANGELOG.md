@@ -16,6 +16,15 @@
   cover a container's new connection, a published port (LAN -> DNAT ->
   container, replies) and container-to-container across two bridges. Already-
   protected guests need `FORCE_REDEPLOY=1` to receive the fix.
+  Follow-ups from review: the ruleset no longer puts wildcard interface names
+  inside anonymous sets (nft 1.0.2 / Ubuntu 22.04 failed to load the whole file
+  with "Byteorder mismatch"; a bats test guards it); `tailscale0` -> container
+  (subnet router) keeps working, with a rig case; replies of DNATed connections
+  no longer leave a br-* uplink (`ct status ! dnat`), with a rig case; the
+  forward-chain comment about `ct direction reply` was inverted and is fixed.
+  Documented, not fixed: on a br-* uplink a container's new connection to a
+  private non-LAN address still leaves the uplink, and a LAN host with a static
+  route to the container subnet is not allowed (add it to `MULLVAD_LAN_SUBNET`).
 - README: on a `br-*`-named uplink `output`'s `ct direction reply` accepts let
   the guest's replies to inbound connections from outside the LAN set leave the
   uplink; the caveat now says so instead of claiming they are dropped.
