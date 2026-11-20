@@ -150,7 +150,8 @@ or push anything. The one thing it writes is its own log in
 ### Re-running on the same node
 
 Re-runs are **idempotent**: by default a guest that's already protected (rotate
-script present + kill-switch service enabled + self-heal timer active) is
+script present + kill-switch service enabled + self-heal timer active + the
+`inet mullvad_killswitch` table actually loaded, i.e. `nft list table inet mullvad_killswitch` succeeds) is
 **skipped** and left untouched — so a plain re-run does *not* re-push assets or
 pick up config/asset changes on guests deployed by an earlier run. To roll out a
 new ruleset or changed settings (for example this LAN-reachability update) to
@@ -192,6 +193,10 @@ Every run writes a timestamped log to `/root/bulkvpn-<timestamp>.log` and prints
 - The same table also has a `forward` chain with a default `drop` policy, so traffic the guest *forwards* — Docker/Podman containers on a bridge network, for example — is held to the same rule. Forwarded packets are allowed only when they leave through `tailscale0`, are addressed to the allowed LAN subnets, or are headed *into* a local container bridge (`docker*`, `br-*`, `podman*`, `cni*`), which keeps container-to-container traffic and published ports working. A container's internet traffic therefore goes through the exit node or is dropped; it can no longer slip out the physical NIC when the tunnel is down.
 - `mullvad-healthcheck.timer` runs `mullvad-rotate.sh --check-only` 2 minutes after boot and every 15 minutes, re-acquiring a working Mullvad exit node whenever connectivity is down.
 - Manual controls inside a guest (as root): `mullvad-rotate.sh` (rotate now), `systemctl status mullvad-healthcheck.timer`, `tail -f /var/log/mullvad-rotate.log`.
+
+- **The watchdog checks that the kill-switch is loaded.** Every run of `mullvad-rotate.sh` (timer and `--check-only` alike) first runs `nft list table inet mullvad_killswitch`. If the table is gone (`nft flush ruleset`, `systemctl restart nftables`, an nftables package upgrade), it logs that the table was missing, reloads `/etc/nftables.d/mullvad-killswitch.nft`, and only then continues; since a connectivity probe is not proof of a tunnel without the firewall, the run goes on to re-acquire an exit node rather than report "tunnel healthy". If the ruleset file is missing or invalid, it logs an `ERROR` naming the kill-switch and exits non-zero without probing or touching Tailscale. With the table present nothing changes.
+- **`nftables.service` interaction.** `mullvad-killswitch.service` declares `After=`, `PartOf=` and `ReloadPropagatedFrom=nftables.service` plus an `ExecReload=` that loads the ruleset, so a restart or reload of `nftables.service` re-applies the kill-switch immediately instead of at the next watchdog run (up to 15 minutes later). Guests without `nftables.service` are unaffected. This unit behaviour has not been exercised on a running systemd; the tests check the unit text only.
+- **Already-protected guests need `FORCE_REDEPLOY=1`** to receive the new watchdog and unit. A guest whose table is currently missing is no longer treated as already protected and is deployed to by a plain run.
 
 ## Caveats
 

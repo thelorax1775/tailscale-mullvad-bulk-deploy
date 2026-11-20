@@ -161,7 +161,9 @@ ALLOW_LAN=true                 # keep LAN access to the web UI / SSH
 LAN_SUBNETS=""                 # space-separated CIDRs to keep reachable directly
                                # (off the exit-node tunnel), e.g. other guests' LANs
 LAN_BYPASS_PRIO=5200           # ip-rule priority (above Tailscale's ~5230 diverter)
-LOG_FILE="/var/log/mullvad-rotate.log"
+LOG_FILE="${MULLVAD_LOG_FILE:-/var/log/mullvad-rotate.log}"
+KILLSWITCH_RULES="${MULLVAD_KILLSWITCH_RULES:-/etc/nftables.d/mullvad-killswitch.nft}"
+NFT="${MULLVAD_NFT:-/usr/sbin/nft}"
 CHECK_TIMEOUT=8                # seconds per connectivity probe
 TUNNEL_SETTLE=3                # seconds to wait after switching before probing
 TAILSCALE="$(command -v tailscale || echo /usr/bin/tailscale)"
@@ -172,6 +174,26 @@ CHECK_ONLY=false
 
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FILE"; }
 die() { log "ERROR: $*"; exit 1; }
+
+# ensure_killswitch: the probe in verify_connectivity is only proof of a working
+# tunnel while the kill-switch table is loaded. Something else can remove it
+# (`systemctl restart nftables`, a package upgrade, `nft flush ruleset`) while
+# mullvad-killswitch.service stays "active" (oneshot, RemainAfterExit), so check
+# the table itself first, on every run, and put it back before anything else.
+# If it cannot be restored, stop: no probe, no "healthy".
+ensure_killswitch() {
+    if "$NFT" list table inet mullvad_killswitch >/dev/null 2>&1; then
+        return 0
+    fi
+    log "WARN: kill-switch table inet mullvad_killswitch is missing - reloading $KILLSWITCH_RULES"
+    [[ -r "$KILLSWITCH_RULES" ]] || die "kill-switch table is missing and the ruleset file $KILLSWITCH_RULES is not readable - cannot restore it"
+    "$NFT" -f "$KILLSWITCH_RULES" || die "kill-switch table is missing and loading $KILLSWITCH_RULES failed - cannot restore it"
+    "$NFT" list table inet mullvad_killswitch >/dev/null 2>&1 \
+        || die "kill-switch table is still missing after loading $KILLSWITCH_RULES"
+    log "kill-switch table was missing and was reloaded from $KILLSWITCH_RULES"
+}
+
+ensure_killswitch
 
 [[ -x "$TAILSCALE" ]] || die "tailscale binary not found at '$TAILSCALE'"
 
@@ -382,12 +404,16 @@ cat <<'KS_EOF'
 [Unit]
 Description=Mullvad/Tailscale fail-closed kill-switch (nftables)
 Wants=network-pre.target
+After=nftables.service
+PartOf=nftables.service
+ReloadPropagatedFrom=nftables.service
 Before=network-pre.target tailscaled.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f /etc/nftables.d/mullvad-killswitch.nft
+ExecReload=/usr/sbin/nft -f /etc/nftables.d/mullvad-killswitch.nft
 
 [Install]
 WantedBy=multi-user.target
@@ -468,7 +494,7 @@ GUEST_PM='pm_install(){ if command -v apt-get >/dev/null 2>&1; then export DEBIA
 CMD_HAS_SYSTEMD='test -d /run/systemd/system'
 # shellcheck disable=SC2016
 CMD_TS_PROBE='b=0; command -v tailscale >/dev/null 2>&1 && b=1; f=0; p=0; s=/var/lib/tailscale/tailscaled.state; if [ -s "$s" ]; then f=1; grep -qE "\"(_current-profile|_profiles|_daemon|profile-[^\"]+)\"" "$s" && p=1; fi; [ -n "$(ls -A /var/lib/tailscale 2>/dev/null)" ] && f=1; svc=$(systemctl is-active tailscaled 2>/dev/null); st=""; if [ "$b" = 1 ]; then for i in 1 2 3 4 5; do st=$(tailscale status --json 2>/dev/null | sed -n "s/.*\"BackendState\": *\"\([A-Za-z]*\)\".*/\1/p" | head -n1); case "$st" in ""|NoState|Starting) [ "$i" = 5 ] || sleep 2 ;; *) break ;; esac; done; fi; echo "bin=$b state=$f profile=$p svc=${svc:-none} backend=${st:-unknown}"'
-CMD_PROTECTED='test -x /usr/local/bin/mullvad-rotate.sh && systemctl is-enabled --quiet mullvad-killswitch.service && systemctl is-active --quiet mullvad-healthcheck.timer'
+CMD_PROTECTED='test -x /usr/local/bin/mullvad-rotate.sh && systemctl is-enabled --quiet mullvad-killswitch.service && systemctl is-active --quiet mullvad-healthcheck.timer && nft list table inet mullvad_killswitch >/dev/null 2>&1'
 CMD_MULLVAD_AVAIL='tailscale exit-node list 2>/dev/null | grep -qi "mullvad.ts.net"'
 # Print the guest's own directly-connected IPv4 LAN subnet(s), excluding
 # loopback, link-local, and the Tailscale CGNAT range (100.64.0.0/10).
@@ -480,7 +506,7 @@ CMD_INSTALL_KS_DEPS="$GUEST_PM"'; command -v nft >/dev/null 2>&1 || pm_install n
 # oneshot service and would leave the old LAN set loaded in the kernel.
 CMD_ENABLE='systemctl daemon-reload && systemctl enable mullvad-killswitch.service && systemctl restart mullvad-killswitch.service && systemctl enable mullvad-healthcheck.timer && systemctl restart mullvad-healthcheck.timer'
 CMD_KICK='/usr/local/bin/mullvad-rotate.sh'
-CMD_VERIFY='test -x /usr/local/bin/mullvad-rotate.sh && systemctl is-active --quiet mullvad-healthcheck.timer && nft list table inet mullvad_killswitch >/dev/null 2>&1'
+CMD_VERIFY='test -x /usr/local/bin/mullvad-rotate.sh && systemctl is-active --quiet mullvad-healthcheck.timer'
 
 ### ---- Host prerequisites ---------------------------------------------------
 require_host_tools() {

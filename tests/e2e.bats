@@ -116,3 +116,34 @@ stray_files() {
     [[ "$output" == *"--auth-key='file:/run/bulkvpn-ts-authkey'"* ]]
     [[ "$output" != *"pct reboot"* ]]
 }
+
+@test "real run: a guest with script, service and timer but no kill-switch table is deployed to, not skipped" {
+    fixture_lxc '[{"vmid":101,"status":"running","name":"flushed"},{"vmid":102,"status":"running","name":"intact"}]'
+    fixture_qemu '[]'
+    fixture_flag ct101.protected
+    fixture_flag ct101.notable
+    fixture_flag ct101.mullvad
+    fixture_probe ct101 'bin=1 state=1 profile=1 svc=active backend=Running'
+    fixture_flag ct102.protected
+    DRY_RUN=0 run_main
+    echo "$output"
+    [[ "$output" != *"ct/101 (flushed)] SKIP — kill-switch already installed"* ]]
+    [[ "$output" == *"ct/102 (intact)] SKIP — kill-switch already installed"* ]]
+    run calls_log
+    [[ "$output" == *"pct exec 101"*"/usr/local/bin/mullvad-rotate.sh"*"base64 -d"* ]]
+    [[ "$output" != *"pct exec 102"*"base64 -d"* ]]
+}
+
+@test "DRY_RUN=1: a guest with script, service and timer but no kill-switch table is reported as WOULD deploy" {
+    fixture_lxc '[{"vmid":101,"status":"running","name":"flushed"}]'
+    fixture_qemu '[]'
+    fixture_flag ct101.protected
+    fixture_flag ct101.notable
+    fixture_flag ct101.mullvad
+    fixture_probe ct101 'bin=1 state=1 profile=1 svc=active backend=Running'
+    DRY_RUN=1 run_main
+    echo "$output"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"[ct/101 (flushed)] WOULD deploy"* ]]
+    [[ "$output" == *"WOULD_DEPLOY=1"* ]]
+}
