@@ -14,6 +14,8 @@
   are inserted at the end of those, before the blank lines that precede the
   first snapshot. Snapshot sections are left byte-identical. New variable
   `PVE_LXC_CONF_DIR` (default `/etc/pve/lxc`) names the config directory.
+  If the rewrite fails or yields an unexpected line count, the CT config is left
+  untouched and a WARN line says the tun lines were not written.
 - Watchdog: `mullvad-rotate.sh` now restores the kill-switch when something has
   removed it. Its connectivity probe counts any successful connect as a working
   tunnel, which is only true while the kill-switch is loaded; after

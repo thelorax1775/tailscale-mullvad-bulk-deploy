@@ -151,3 +151,38 @@ snap() {  # snap NAME [extra lines...]
     [[ "$output" == *"WOULD enroll"*"add /dev/net/tun to the CT config and reboot the CT"* ]]
     cmp "$CONF" "$BATS_TEST_TMPDIR/orig"
 }
+
+@test "a failing rewrite leaves the CT config byte-identical and says why" {
+    { base_current; printf 'rootfs: local:150/disk.raw\n\n'; snap old; } > "$CONF"
+    cp "$CONF" "$BATS_TEST_TMPDIR/orig"
+    real_awk="$(command -v awk)"
+    # awk used for the rewrite (-v add=...) prints one line and fails, like a full /tmp
+    # shellcheck disable=SC2016
+    printf '#!/bin/bash\nif [ "$1" = "-v" ]; then echo "arch: amd64"; exit 2; fi\nexec %s "$@"\n' "$real_awk" > "$STUB_BIN/awk"
+    chmod +x "$STUB_BIN/awk"
+    run lib enable_tun_lxc 150
+    echo "$output"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"WARN"*"NOT written"* ]]
+    cmp "$CONF" "$BATS_TEST_TMPDIR/orig"
+}
+
+@test "a rewrite with the wrong line count is not copied over the config" {
+    { base_current; printf '\n'; snap old; } > "$CONF"
+    cp "$CONF" "$BATS_TEST_TMPDIR/orig"
+    real_awk="$(command -v awk)"
+    # exits 0 but drops lines
+    # shellcheck disable=SC2016
+    printf '#!/bin/bash\nif [ "$1" = "-v" ]; then echo "arch: amd64"; exit 0; fi\nexec %s "$@"\n' "$real_awk" > "$STUB_BIN/awk"
+    chmod +x "$STUB_BIN/awk"
+    run lib enable_tun_lxc 150
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"expected"* ]]
+    cmp "$CONF" "$BATS_TEST_TMPDIR/orig"
+}
+
+@test "a missing config logs why no tun lines were written" {
+    run lib enable_tun_lxc 999
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"not found"*"NOT written"* ]]
+}

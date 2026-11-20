@@ -617,7 +617,7 @@ lxc_conf_path() { printf '%s/%s.conf' "$PVE_LXC_CONF_DIR" "$1"; }
 # snapshot with its own copy of the settings. Only the lines before the first
 # [..] header are the container's current settings.
 lxc_current_settings() {   # $1 vmid -> echoes the current settings
-    awk '/^\[.+\]$/ { exit } { print }' "$(lxc_conf_path "$1")" 2>/dev/null
+    awk '/^\[.+\]$/ { exit } { print }' "$(lxc_conf_path "$1")" 2>/dev/null || true
 }
 
 lxc_is_unprivileged() { lxc_current_settings "$1" | grep -q '^unprivileged: 1'; }
@@ -650,11 +650,14 @@ enable_tun_lxc() {   # returns 0 = no change, 1 = changed (reboot needed)
     grep -q '^lxc.mount.entry: /dev/net/tun' <<<"$cur" \
         || add+="${LXC_TUN_MNT_LINE}"$'\n'
     [[ -z "$add" ]] && return 0
-    [[ -f "$conf" ]] || return 0
-    tmp="$(mktemp)" || return 0
+    if [[ ! -f "$conf" ]]; then
+        log "  [CT $vmid] WARN: $conf not found; /dev/net/tun lines NOT written"
+        return 0
+    fi
+    tmp="$(mktemp)" || { log "  [CT $vmid] WARN: mktemp failed; /dev/net/tun lines NOT written"; return 0; }
     # Insert at the end of the current settings, before the blank lines that
     # separate them from the first snapshot header.
-    awk -v add="$add" '
+    if ! awk -v add="$add" '
         { l[NR] = $0 }
         END {
             n = NR
@@ -663,8 +666,21 @@ enable_tun_lxc() {   # returns 0 = no change, 1 = changed (reboot needed)
             for (i = 1; i <= n; i++) print l[i]
             printf "%s", add
             for (i = n + 1; i <= NR; i++) print l[i]
-        }' "$conf" > "$tmp"
+        }' "$conf" > "$tmp"; then
+        log "  [CT $vmid] WARN: rewriting $conf failed; left untouched, /dev/net/tun lines NOT written"
+        rm -f "$tmp"; return 0
+    fi
+    # The rewrite must be the original plus exactly the added lines; anything
+    # else (full disk, truncated output) must never replace the CT config.
+    local want got
+    want=$(( $(awk 'END { print NR }' "$conf") + $(grep -c '' <<<"${add%$'\n'}") ))
+    got="$(awk 'END { print NR }' "$tmp")"
+    if [[ "$got" != "$want" ]]; then
+        log "  [CT $vmid] WARN: rewritten config has $got lines, expected $want; $conf left untouched, /dev/net/tun lines NOT written"
+        rm -f "$tmp"; return 0
+    fi
     if ! cat "$tmp" > "$conf"; then
+        log "  [CT $vmid] WARN: writing $conf failed; /dev/net/tun lines NOT written"
         rm -f "$tmp"; return 0
     fi
     rm -f "$tmp"
