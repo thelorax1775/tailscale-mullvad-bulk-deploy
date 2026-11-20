@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Fixed
+
+- Kill-switch: connections opened through the tunnel no longer leave through the
+  physical NIC after the exit node is cleared. `ct state established,related
+  accept` sat before any interface check in both chains; when Tailscale removed
+  the default route from table 52 (as `mullvad-rotate.sh` does on purpose, and
+  as happens when a node dies) the flow was re-routed to `eth0` with its
+  `100.64.x.x` source and that rule let it out. The rule is gone from `output`
+  and `forward`; every packet is now judged by its interface or destination.
+  Reproduced with the leak rig (a TCP client keeps writing while the table-52
+  default route is deleted: 29 packets on the physical side before the fix, 0
+  after) and with the audit script `tailscale-mullvad-bulk-deploy-repro.sh`
+  case 1 (0 packets before the route was removed, 4 after). The forwarded half
+  is covered with a container namespace whose traffic is SNATed to the
+  Tailscale address; with `masquerade` the kernel already refuses to move such a
+  flow. Already-protected guests need `FORCE_REDEPLOY=1` to receive the fix.
+- Kill-switch: UDP port 67 is no longer open to the whole internet. `udp dport
+  67 accept` had no source port, destination or address family, so any program
+  could send UDP to port 67 on any host with the tunnel down. Only the DHCP
+  client form (`udp sport 68 udp dport 67 ip daddr 255.255.255.255`) is allowed
+  now. Reproduced with the leak rig (UDP from an unprivileged port to
+  203.0.113.10:67 and to `2001:db8::10` port 67: 3 and 9 packets on the
+  physical side before the fix, 0 after) and with the audit script case 2.
+  Already-protected guests need `FORCE_REDEPLOY=1` to receive the fix.
+- Kill-switch `output` chain now accepts packets for local container bridges
+  (`docker*`, `br-*`, `podman*`, `cni*`), reply direction only (`ct direction
+  reply`), so a guest's own replies to a container keep working without the
+  established/related rule. Known limitation: on a guest whose physical uplink
+  is named like one of these, the `forward` chain's plain accept still applies
+  (see README).
+
 ### Added
 
 - Automatic checks. `./check.sh` runs `bash -n`, ShellCheck, a bats suite and a

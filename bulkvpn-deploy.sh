@@ -316,9 +316,13 @@ table inet mullvad_killswitch {
     chain output {
         type filter hook output priority 0; policy drop;
 
-        # Loopback and already-established/related flows.
+        # Loopback only. There is deliberately NO blanket "ct state
+        # established,related accept": a flow opened through tailscale0 stays
+        # "established" after the exit node goes away, the route then falls
+        # back to eth0, and such a rule would let it leave with the real NIC.
+        # Every packet is judged by where it is going instead; replies to an
+        # inbound connection are covered by the LAN and tailscale0 rules.
         oif "lo" accept
-        ct state established,related accept
 
         # App traffic that has been routed into the Tailscale tunnel.
         oifname "tailscale0" accept
@@ -331,8 +335,24 @@ table inet mullvad_killswitch {
         # Local network: keep the qBittorrent web UI / SSH reachable from LAN.
         ip daddr $LAN accept
 
-        # DHCP renew (harmless if you use a static IP).
-        udp dport 67 accept
+        # The guest's replies to containers on a local bridge (DNS, a service on
+        # the guest). Only reply-direction packets: a NEW connection from the
+        # guest into a bridge is not allowed unless that subnet is in the LAN
+        # set. Direction (not conntrack state) is what keeps this safe: a flow
+        # the guest opened through the tunnel is direction "original", so it
+        # never matches here, even if it is re-routed onto an uplink whose name
+        # happens to match br-*. (Such an uplink still gets the plain "br-*"
+        # accept in chain forward; see the README caveats.)
+        oifname "docker*" ct direction reply accept
+        oifname "br-*" ct direction reply accept
+        oifname "podman*" ct direction reply accept
+        oifname "cni*" ct direction reply accept
+
+        # DHCP client (harmless if you use a static IP): only the client
+        # port 68 -> server port 67, only to the IPv4 broadcast address.
+        # Unicast renewals go to the DHCP server, which is on the LAN above.
+        # Anything else aimed at port 67 is ordinary egress and is dropped.
+        udp sport 68 udp dport 67 ip daddr 255.255.255.255 accept
 
         # Everything else — raw internet egress over the physical NIC — is
         # dropped by the chain policy. That is the leak protection.
@@ -341,8 +361,9 @@ table inet mullvad_killswitch {
     chain forward {
         type filter hook forward priority 0; policy drop;
 
-        ct state established,related accept
-
+        # No blanket "ct state established,related accept" here either: a
+        # forwarded flow that was NATed out tailscale0 would otherwise follow
+        # the re-routed packets out of eth0 when the exit node goes away.
         oifname "tailscale0" accept
 
         ip daddr $LAN accept

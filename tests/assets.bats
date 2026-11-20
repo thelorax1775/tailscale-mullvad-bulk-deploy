@@ -34,3 +34,30 @@ check_asset() {   # FUNCTION FILE
 @test "asset_healthcheck_timer is byte-identical to assets/systemd/mullvad-healthcheck.timer" {
     check_asset asset_healthcheck_timer assets/systemd/mullvad-healthcheck.timer
 }
+
+# ---- the kill-switch ruleset must parse for any LAN set ----------------------
+# `nft -c` only checks; it needs a network namespace to run unprivileged.
+nft_check_lan() {   # SPACE-SEPARATED SUBNETS
+    command -v nft >/dev/null 2>&1 || skip "nft not installed"
+    local f="$BATS_TEST_TMPDIR/ks.nft"
+    BULKVPN_LIB_ONLY=1 bash -c 'source "$0" && nft_templated "$(lan_nft_set "$1")"' "$SCRIPT" "$1" > "$f"
+    local ns=(unshare --net) out rc
+    [ "$(id -u)" = 0 ] || ns=(unshare --user --map-root-user --net)
+    "${ns[@]}" true 2>/dev/null || skip "cannot create a network namespace here"
+    out="$("${ns[@]}" nft -c -f "$f" 2>&1)"; rc=$?
+    echo "$out"
+    [ "$rc" -eq 0 ]
+}
+
+@test "nft -c accepts the templated kill-switch for a one-subnet LAN set" {
+    nft_check_lan '192.168.1.0/24'
+}
+
+@test "nft -c accepts the templated kill-switch for a five-subnet LAN set" {
+    nft_check_lan '192.168.1.0/24 192.168.2.0/24 10.0.0.0/8 172.16.0.0/12 100.100.0.0/16'
+}
+
+@test "the kill-switch has no blanket established/related accept and no bare port-67 accept" {
+    run grep -nE '^[[:space:]]*(ct state established|udp dport 67 accept)' "$REPO/assets/nftables/mullvad-killswitch.nft"
+    [ "$status" -eq 1 ]
+}

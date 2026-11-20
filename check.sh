@@ -46,6 +46,12 @@ bats --tap tests || fail "bats"
 step "leak rig"
 bash tests/leak/run.sh
 rc=$?
+if [[ "$rc" == 0 ]]; then
+    # Same rig with a physical NIC called br-up: a name that matches the
+    # container-bridge accepts must not re-open the guest's own flows.
+    BULKVPN_LEAK_PHYS=br-up bash tests/leak/run.sh
+    rc=$?
+fi
 if [[ "$rc" == 77 ]]; then
     echo "leak rig SKIPPED (namespaces unavailable; with CI=true this would be a failure)"
 elif [[ "$rc" != 0 ]]; then
