@@ -544,15 +544,14 @@ resolve_lan_list() {   # engine id
 # Called from main() and resolve_lan_list().
 validate_lan_extras() {
     [[ -n "$MULLVAD_LAN_SUBNET" ]] || { echo ""; return 0; }
+    local -a entries
     local entry norm prefix
-    for entry in $(printf '%s' "$MULLVAD_LAN_SUBNET" | tr ',' ' '); do
-        # Protect from glob expansion
-        entry="${entry//\*/}"
-        entry="${entry//\?/}"
-        entry="${entry//\[/}"
-        norm="$(cidr_network "$entry" 2>/dev/null)" || { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "FATAL: MULLVAD_LAN_SUBNET: invalid CIDR '$entry'" >&2; return 1; }
+    # Split without globbing: IFS=', ' reads the comma/space separated list safely.
+    IFS=', ' read -ra entries <<<"$MULLVAD_LAN_SUBNET"
+    for entry in "${entries[@]}"; do
+        norm="$(cidr_network "$entry" 2>/dev/null)" || { log "FATAL: MULLVAD_LAN_SUBNET: invalid CIDR '$entry'" >&2; return 1; }
         prefix="${norm##*/}"
-        (( prefix >= 8 )) || { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "FATAL: MULLVAD_LAN_SUBNET: prefix length must be >= 8, got '$entry' (normalised: $norm)" >&2; return 1; }
+        (( prefix >= 8 )) || { log "FATAL: MULLVAD_LAN_SUBNET: prefix length must be >= 8, got '$entry' (normalised: $norm)" >&2; return 1; }
         printf '%s ' "$norm"
     done
 }

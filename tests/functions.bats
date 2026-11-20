@@ -188,6 +188,18 @@ IN
     [ "$output" = "10.0.10.0/24 203.0.113.0/24" ]
 }
 
+@test "validate_lan_extras: glob metacharacters are not expanded and are rejected with literal value" {
+    stub_setup
+    # Create a file that would match if glob expansion happened
+    touch "$BATS_TEST_TMPDIR/192.168.1.0_24"
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="1*2.168.1.0/24" run libsh '
+        validate_lan_extras
+    '
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"MULLVAD_LAN_SUBNET"* ]]
+    [[ "$output" == *"1*2.168.1.0/24"* ]]
+}
+
 # ---- lan_nft_set -------------------------------------------------------------
 
 @test "lan_nft_set: several subnets become an nft set literal" {
