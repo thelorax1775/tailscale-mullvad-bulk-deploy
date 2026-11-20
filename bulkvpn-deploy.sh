@@ -18,6 +18,7 @@ MULLVAD_LAN_AGENT_QUERY="${MULLVAD_LAN_AGENT_QUERY:-1}"
 MULLVAD_COUNTRY_FILTER="${MULLVAD_COUNTRY_FILTER:-}"
 MULLVAD_PREFERRED_NODE="${MULLVAD_PREFERRED_NODE:-}"
 PVE_NODE="${PVE_NODE:-$(hostname -s)}"
+PVE_LXC_CONF_DIR="${PVE_LXC_CONF_DIR:-/etc/pve/lxc}"   # CT configs; tests point it at a temp dir
 SELECT_GUESTS="${SELECT_GUESTS:-}"      # space/comma vmids to deploy to; empty = menu (TTY) or all (no TTY)
 DRY_RUN="${DRY_RUN:-0}"
 FORCE_REDEPLOY="${FORCE_REDEPLOY:-0}"   # 1 = re-push to already-protected guests too
@@ -90,6 +91,7 @@ Configuration (environment variables):
                            back within MULLVAD_COUNTRY_FILTER, and each --check-only
                            run moves back once it works again; default: none
   PVE_NODE                 Proxmox node to scan; default: `hostname -s`
+  PVE_LXC_CONF_DIR         directory with the CT configs; default: /etc/pve/lxc
   SELECT_GUESTS            space/comma-separated vmids to deploy to; default:
                            unset. When unset and a terminal is attached, an
                            interactive checklist (whiptail, or a numbered text
@@ -609,7 +611,16 @@ push_file() {   # engine id path mode   (file content on stdin)
 }
 
 ### ---- LXC helpers ----------------------------------------------------------
-lxc_is_unprivileged() { grep -q '^unprivileged: 1' "/etc/pve/lxc/${1}.conf" 2>/dev/null; }
+lxc_conf_path() { printf '%s/%s.conf' "$PVE_LXC_CONF_DIR" "$1"; }
+
+# A CT config is the current settings first, then one [name] section per
+# snapshot with its own copy of the settings. Only the lines before the first
+# [..] header are the container's current settings.
+lxc_current_settings() {   # $1 vmid -> echoes the current settings
+    awk '/^\[.+\]$/ { exit } { print }' "$(lxc_conf_path "$1")" 2>/dev/null || true
+}
+
+lxc_is_unprivileged() { lxc_current_settings "$1" | grep -q '^unprivileged: 1'; }
 
 wait_for_lxc_ready() {
     local vmid="$1" i
@@ -620,22 +631,60 @@ wait_for_lxc_ready() {
     return 1
 }
 
-lxc_tun_configured() {
-    local conf="/etc/pve/lxc/${1}.conf"
-    grep -q '^lxc.cgroup2.devices.allow: c 10:200 rwm' "$conf" 2>/dev/null \
-        && grep -q '^lxc.mount.entry: /dev/net/tun' "$conf" 2>/dev/null
+LXC_TUN_DEV_LINE='lxc.cgroup2.devices.allow: c 10:200 rwm'
+LXC_TUN_MNT_LINE='lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file'
+
+lxc_tun_configured() {   # only the current settings count, never a snapshot section
+    local cur
+    cur="$(lxc_current_settings "$1")"
+    grep -q '^lxc.cgroup2.devices.allow: c 10:200 rwm' <<<"$cur" \
+        && grep -q '^lxc.mount.entry: /dev/net/tun' <<<"$cur"
 }
 
 enable_tun_lxc() {   # returns 0 = no change, 1 = changed (reboot needed)
-    local vmid="$1" changed=0
-    local conf="/etc/pve/lxc/${vmid}.conf"
-    if ! grep -q '^lxc.cgroup2.devices.allow: c 10:200 rwm' "$conf" 2>/dev/null; then
-        echo 'lxc.cgroup2.devices.allow: c 10:200 rwm' >> "$conf"; changed=1
+    local vmid="$1" conf cur add="" tmp
+    conf="$(lxc_conf_path "$vmid")"
+    cur="$(lxc_current_settings "$vmid")"
+    grep -q '^lxc.cgroup2.devices.allow: c 10:200 rwm' <<<"$cur" \
+        || add+="${LXC_TUN_DEV_LINE}"$'\n'
+    grep -q '^lxc.mount.entry: /dev/net/tun' <<<"$cur" \
+        || add+="${LXC_TUN_MNT_LINE}"$'\n'
+    [[ -z "$add" ]] && return 0
+    if [[ ! -f "$conf" ]]; then
+        log "  [CT $vmid] WARN: $conf not found; /dev/net/tun lines NOT written"
+        return 0
     fi
-    if ! grep -q '^lxc.mount.entry: /dev/net/tun' "$conf" 2>/dev/null; then
-        echo 'lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file' >> "$conf"; changed=1
+    tmp="$(mktemp)" || { log "  [CT $vmid] WARN: mktemp failed; /dev/net/tun lines NOT written"; return 0; }
+    # Insert at the end of the current settings, before the blank lines that
+    # separate them from the first snapshot header.
+    if ! awk -v add="$add" '
+        { l[NR] = $0 }
+        END {
+            n = NR
+            for (i = 1; i <= NR; i++) if (l[i] ~ /^\[.+\]$/) { n = i - 1; h = 1; break }
+            while (h && n > 0 && l[n] ~ /^[[:space:]]*$/) n--
+            for (i = 1; i <= n; i++) print l[i]
+            printf "%s", add
+            for (i = n + 1; i <= NR; i++) print l[i]
+        }' "$conf" > "$tmp"; then
+        log "  [CT $vmid] WARN: rewriting $conf failed; left untouched, /dev/net/tun lines NOT written"
+        rm -f "$tmp"; return 0
     fi
-    return $changed
+    # The rewrite must be the original plus exactly the added lines; anything
+    # else (full disk, truncated output) must never replace the CT config.
+    local want got
+    want=$(( $(awk 'END { print NR }' "$conf") + $(grep -c '' <<<"${add%$'\n'}") ))
+    got="$(awk 'END { print NR }' "$tmp")"
+    if [[ "$got" != "$want" ]]; then
+        log "  [CT $vmid] WARN: rewritten config has $got lines, expected $want; $conf left untouched, /dev/net/tun lines NOT written"
+        rm -f "$tmp"; return 0
+    fi
+    if ! cat "$tmp" > "$conf"; then
+        log "  [CT $vmid] WARN: writing $conf failed; /dev/net/tun lines NOT written"
+        rm -f "$tmp"; return 0
+    fi
+    rm -f "$tmp"
+    return 1
 }
 
 ### ---- VM helpers -----------------------------------------------------------
