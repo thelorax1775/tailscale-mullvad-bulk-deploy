@@ -426,5 +426,31 @@ else
     result bad "tunnel up: a connection arriving over tailscale0 gets its replies back over tailscale0" "no answer from the guest"
 fi
 
+# Container bridge: a container (C) reaches a service on the guest at 172.17.0.1
+# and the guest's replies leave through docker0 (the "docker*" established
+# accept in chain output). A NEW connection from the guest into the bridge is
+# not allowed (the bridge subnet is not in the LAN set), so it must fail.
+tunnel_down; reset
+g python3 -c "$INBOUND_SERVER" 172.17.0.1 &
+sp=$!
+sleep 0.5
+out="$(c timeout 6 python3 -c "$INBOUND_CLIENT" 172.17.0.2 172.17.0.1 2>&1)"
+wait "$sp" 2>/dev/null
+if [[ "$out" == "pong:ping" ]]; then
+    result ok "tunnel down: a container connects to a service on the guest over the bridge and gets its replies" "ping answered with pong"
+else
+    result bad "tunnel down: a container connects to a service on the guest over the bridge and gets its replies" "got: ${out:-nothing}"
+fi
+c python3 -c "$INBOUND_SERVER" 172.17.0.2 &
+sp=$!
+sleep 0.5
+out="$(g timeout 4 python3 -c "$INBOUND_CLIENT" 172.17.0.1 172.17.0.2 2>&1)"
+kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+if [[ "$out" != "pong:ping" ]]; then
+    result ok "tunnel down: a NEW connection from the guest into the container bridge is dropped (bridge subnet is not in the LAN set)" "no answer, as documented"
+else
+    result bad "tunnel down: a NEW connection from the guest into the container bridge is dropped (bridge subnet is not in the LAN set)" "the connection completed"
+fi
+
 echo "leak rig: $pass passed, $fail failed"
 [[ "$fail" == 0 ]]

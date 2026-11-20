@@ -39,12 +39,16 @@ table inet mullvad_killswitch {
         # Local network: keep the qBittorrent web UI / SSH reachable from LAN.
         ip daddr $LAN accept
 
-        # The guest's own replies to containers on a local bridge (DNS, a
-        # service on the guest). These never leave the machine.
-        oifname "docker*" accept
-        oifname "br-*" accept
-        oifname "podman*" accept
-        oifname "cni*" accept
+        # The guest's replies to containers on a local bridge (DNS, a service on
+        # the guest). Only packets of connections the container opened: a NEW
+        # connection from the guest into a bridge is not allowed unless that subnet
+        # is in the LAN set. Being limited to established flows also means a
+        # physical uplink that happens to be called br-* is not opened up: a
+        # re-routed flow changes oifname and no longer matches.
+        oifname "docker*" ct state established,related accept
+        oifname "br-*" ct state established,related accept
+        oifname "podman*" ct state established,related accept
+        oifname "cni*" ct state established,related accept
 
         # DHCP client (harmless if you use a static IP): only the client
         # port 68 -> server port 67, only to the IPv4 broadcast address.
