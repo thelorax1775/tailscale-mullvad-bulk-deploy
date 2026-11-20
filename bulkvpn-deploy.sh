@@ -498,14 +498,41 @@ HT_EOF
 }
 
 # Templated variants (apply per-deployment config).
+# Uses bash to shell-quote values with printf '%q', then substitutes them
+# into the template using awk (no regex/replacement metacharacters involved),
+# so special characters (&, |, ", $, etc.) are written literally and safely.
 rotate_templated() {   # $1 = space-separated LAN subnets to keep off the tunnel
-    asset_rotate \
-        | sed "s|^COUNTRY_FILTER=.*|COUNTRY_FILTER=\"${MULLVAD_COUNTRY_FILTER}\"|" \
-        | sed "s|^PREFERRED_NODE=.*|PREFERRED_NODE=\"${MULLVAD_PREFERRED_NODE}\"|" \
-        | sed "s|^LAN_SUBNETS=.*|LAN_SUBNETS=\"${1}\"|"
+    local lan_subnets="$1"
+    # Pre-quote all values using bash printf '%q' (safe for eval)
+    local cf pn ls
+    cf=$(printf %q "${MULLVAD_COUNTRY_FILTER}")
+    pn=$(printf %q "${MULLVAD_PREFERRED_NODE}")
+    ls=$(printf %q "${lan_subnets}")
+    asset_rotate | awk -v cf="${cf}" -v pn="${pn}" -v ls="${ls}" '
+        /^COUNTRY_FILTER=/ {
+            print "COUNTRY_FILTER=" cf
+            next
+        }
+        /^PREFERRED_NODE=/ {
+            print "PREFERRED_NODE=" pn
+            next
+        }
+        /^LAN_SUBNETS=/ {
+            print "LAN_SUBNETS=" ls
+            next
+        }
+        { print }
+    '
 }
 nft_templated() {   # $1 = LAN value for the nft `define LAN` line (e.g. "{ 192.168.1.0/24 }")
-    asset_nft | sed "s|^define LAN = .*|define LAN = ${1}|"
+    local lan_value="$1"
+    asset_nft | awk -v lv="${lan_value}" '
+        /^define LAN = / {
+            print "define LAN = " lv
+            next
+        }
+        { print }
+    '
 }
 
 # Union of every running guest's own LAN subnet(s), collected up-front by
@@ -786,9 +813,19 @@ deploy_killswitch() {   # engine id label
     lan_set="$(lan_nft_set "$lan_list")"
     log "  [$label] LAN kept reachable: $lan_set"
 
+    log "  [$label] rendering kill-switch assets"
+    local rotate_script nft_ruleset
+    rotate_script="$(rotate_templated "$lan_list")" || { log "  [$label] FAILED to render rotate script"; return 1; }
+    [[ -n "$rotate_script" ]] || { log "  [$label] FAILED: rendered rotate script is empty"; return 1; }
+    # Validate syntax before pushing
+    bash -n <<<"$rotate_script" || { log "  [$label] FAILED: rendered rotate script has syntax errors"; return 1; }
+
+    nft_ruleset="$(nft_templated "$lan_set")" || { log "  [$label] FAILED to render nft ruleset"; return 1; }
+    [[ -n "$nft_ruleset" ]] || { log "  [$label] FAILED: rendered nft ruleset is empty"; return 1; }
+
     log "  [$label] pushing kill-switch assets"
-    rotate_templated "$lan_list"  | push_file "$engine" "$id" /usr/local/bin/mullvad-rotate.sh 755 || return 1
-    nft_templated "$lan_set"      | push_file "$engine" "$id" /etc/nftables.d/mullvad-killswitch.nft 644 || return 1
+    printf '%s' "$rotate_script" | push_file "$engine" "$id" /usr/local/bin/mullvad-rotate.sh 755 || return 1
+    printf '%s' "$nft_ruleset"   | push_file "$engine" "$id" /etc/nftables.d/mullvad-killswitch.nft 644 || return 1
     asset_killswitch_service    | push_file "$engine" "$id" /etc/systemd/system/mullvad-killswitch.service 644 || return 1
     asset_healthcheck_service   | push_file "$engine" "$id" /etc/systemd/system/mullvad-healthcheck.service 644 || return 1
     asset_healthcheck_timer     | push_file "$engine" "$id" /etc/systemd/system/mullvad-healthcheck.timer 644 || return 1
