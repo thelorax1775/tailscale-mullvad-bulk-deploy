@@ -531,23 +531,30 @@ resolve_lan_list() {   # engine id
         fi
     fi
     [[ "$MULLVAD_LAN_INCLUDE_GUESTS" == "1" ]] && guests="$GUEST_LAN_SET"
-    # Validate MULLVAD_LAN_SUBNET extras: each must be a valid CIDR with prefix >= 8.
-    # Invalid entries stop the script before any guest is touched.
-    extras=""
-    if [[ -n "$MULLVAD_LAN_SUBNET" ]]; then
-        local entry norm
-        for entry in $(printf '%s' "$MULLVAD_LAN_SUBNET" | tr ',' ' '); do
-            norm="$(cidr_network "$entry" 2>/dev/null)" || { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "FATAL: MULLVAD_LAN_SUBNET: invalid CIDR '$entry'" >&2; return 1; }
-            local prefix
-            prefix="${norm##*/}"
-            (( prefix >= 8 )) || { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "FATAL: MULLVAD_LAN_SUBNET: prefix length must be >= 8, got '$entry' (normalised: $norm)" >&2; return 1; }
-            extras+=" $norm"
-        done
-    fi
+    extras="$(validate_lan_extras)" || return 1
     # normalise to one CIDR per line, keep only things that look like subnets, dedupe.
     all="$(printf '%s %s %s\n' "$extras" "$detected" "$guests" | tr ' ' '\n' | grep -E '/[0-9]+$' | sort -u || true)"
     [[ -n "$all" ]] || all=$'10.0.0.0/8\n172.16.0.0/12\n192.168.0.0/16'
     printf '%s' "$(printf '%s\n' "$all" | paste -sd' ' -)"
+}
+
+# validate_lan_extras: validate MULLVAD_LAN_SUBNET entries and print normalized ones.
+# Each must be a valid IPv4 CIDR with prefix >= 8. Exits non-zero on any invalid entry.
+# Uses cidr_network for validation and normalization (host bits cleared).
+# Called from main() and resolve_lan_list().
+validate_lan_extras() {
+    [[ -n "$MULLVAD_LAN_SUBNET" ]] || { echo ""; return 0; }
+    local entry norm prefix
+    for entry in $(printf '%s' "$MULLVAD_LAN_SUBNET" | tr ',' ' '); do
+        # Protect from glob expansion
+        entry="${entry//\*/}"
+        entry="${entry//\?/}"
+        entry="${entry//\[/}"
+        norm="$(cidr_network "$entry" 2>/dev/null)" || { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "FATAL: MULLVAD_LAN_SUBNET: invalid CIDR '$entry'" >&2; return 1; }
+        prefix="${norm##*/}"
+        (( prefix >= 8 )) || { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "FATAL: MULLVAD_LAN_SUBNET: prefix length must be >= 8, got '$entry' (normalised: $norm)" >&2; return 1; }
+        printf '%s ' "$norm"
+    done
 }
 
 # lan_nft_set: turn a space-separated subnet list into an nft set literal,
@@ -1187,15 +1194,7 @@ main() {
 
     # Validate MULLVAD_LAN_SUBNET early: each entry must be a valid CIDR with prefix >= 8.
     # Invalid entries stop the script before any guest is touched.
-    if [[ -n "$MULLVAD_LAN_SUBNET" ]]; then
-        local entry norm
-        for entry in $(printf '%s' "$MULLVAD_LAN_SUBNET" | tr ',' ' '); do
-            norm="$(cidr_network "$entry" 2>/dev/null)" || die "MULLVAD_LAN_SUBNET: invalid CIDR '$entry'"
-            local prefix
-            prefix="${norm##*/}"
-            (( prefix >= 8 )) || die "MULLVAD_LAN_SUBNET: prefix length must be >= 8, got '$entry' (normalised: $norm)"
-        done
-    fi
+    validate_lan_extras >/dev/null || return 1
 
     ensure_host_tun
 

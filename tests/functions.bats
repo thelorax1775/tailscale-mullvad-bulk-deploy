@@ -3,6 +3,8 @@
 
 load helpers
 
+bats_require_minimum_version 1.5.0
+
 # ---- ts_classify -------------------------------------------------------------
 
 @test "ts_classify: backend Running is ready" {
@@ -125,37 +127,25 @@ IN
 # ---- resolve_lan_list --------------------------------------------------------
 
 @test "resolve_lan_list: guest auto-detected non-private subnets are ignored and logged" {
-    stub_setup
-    # Mock run_guest to return non-private + private subnets
-    # The stub pct exec will run CMD_DETECT_LAN
-    fixture_lxc '[{"vmid":101,"status":"running","name":"web"}]'
-    # We need to override the stub's guest_cmd to handle CMD_DETECT_LAN
-    # Instead, let's test the logic directly using libsh
-    MULLVAD_LAN_AUTODETECT=1 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="" run libsh '
+    MULLVAD_LAN_AUTODETECT=1 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="" run --separate-stderr libsh '
         run_guest() { echo "0.0.0.0/1 128.0.0.0/1 192.168.10.0/24"; }
         resolve_lan_list lxc 101
     '
     [ "$status" -eq 0 ]
-    [[ "$output" == *"192.168.10.0/24" ]]
-    [[ "$output" == *"ignoring non-private subnet(s): 0.0.0.0/1 128.0.0.0/1"* ]]
+    [ "$output" = "192.168.10.0/24" ]
+    # shellcheck disable=SC2154
+    [[ "$stderr" == *"ignoring non-private subnet(s): 0.0.0.0/1 128.0.0.0/1"* ]]
 }
 
 @test "resolve_lan_list: only non-private auto-detected subnets falls back to RFC1918" {
-    stub_setup
-    fixture_lxc '[{"vmid":101,"status":"running","name":"web"}]'
-    MULLVAD_LAN_AUTODETECT=1 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="" run libsh '
+    MULLVAD_LAN_AUTODETECT=1 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="" run --separate-stderr libsh '
         run_guest() { echo "0.0.0.0/1 128.0.0.0/1"; }
         resolve_lan_list lxc 101
     '
     [ "$status" -eq 0 ]
-    [[ "$output" == *"10.0.0.0/8"* ]]
-    [[ "$output" == *"172.16.0.0/12"* ]]
-    [[ "$output" == *"192.168.0.0/16"* ]]
-    # The last line of output should be the subnet list (no 0.0.0.0/1 or 128.0.0.0/1)
-    last_line="$(printf '%s\n' "$output" | tail -n1)"
-    [[ "$last_line" != *"0.0.0.0/1"* ]]
-    [[ "$last_line" != *"128.0.0.0/1"* ]]
-    [[ "$output" == *"ignoring non-private subnet(s): 0.0.0.0/1 128.0.0.0/1"* ]]
+    [ "$output" = "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16" ]
+    # shellcheck disable=SC2154
+    [[ "$stderr" == *"ignoring non-private subnet(s): 0.0.0.0/1 128.0.0.0/1"* ]]
 }
 
 @test "resolve_lan_list: MULLVAD_LAN_SUBNET invalid CIDR /0 exits non-zero" {
