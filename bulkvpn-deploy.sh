@@ -506,7 +506,7 @@ CMD_INSTALL_KS_DEPS="$GUEST_PM"'; command -v nft >/dev/null 2>&1 || pm_install n
 # oneshot service and would leave the old LAN set loaded in the kernel.
 CMD_ENABLE='systemctl daemon-reload && systemctl enable mullvad-killswitch.service && systemctl restart mullvad-killswitch.service && systemctl enable mullvad-healthcheck.timer && systemctl restart mullvad-healthcheck.timer'
 CMD_KICK='/usr/local/bin/mullvad-rotate.sh'
-CMD_VERIFY='test -x /usr/local/bin/mullvad-rotate.sh && systemctl is-active --quiet mullvad-healthcheck.timer'
+CMD_VERIFY='test -x /usr/local/bin/mullvad-rotate.sh && systemctl is-active --quiet mullvad-healthcheck.timer && nft list table inet mullvad_killswitch >/dev/null 2>&1'
 
 ### ---- Host prerequisites ---------------------------------------------------
 require_host_tools() {

@@ -81,3 +81,9 @@ nft_check_lan() {   # SPACE-SEPARATED SUBNETS
     [[ "$output" == *"nft list table inet mullvad_killswitch"* ]]
     [[ "$output" == *"mullvad-healthcheck.timer"* ]]
 }
+
+@test "CMD_VERIFY still checks the kill-switch table" {
+    # shellcheck disable=SC2016  # expanded by the inner shell
+    run libsh 'printf %s "$CMD_VERIFY"'
+    [[ "$output" == *"nft list table inet mullvad_killswitch"* ]]
+}
