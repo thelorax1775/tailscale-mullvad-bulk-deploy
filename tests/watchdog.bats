@@ -199,8 +199,11 @@ setup_watchdog() {
     MULLVAD_KILLSWITCH_RULES="/etc/nftables.d/mullvad-killswitch.nft"
     export MULLVAD_KILLSWITCH_RULES
     
-    # Get the old version of the script
+    # Get the old version of the script - fetch if needed
     local old_script="$BATS_TEST_TMPDIR/old_rotate.sh"
+    if ! git -C "$REPO" cat-file -e a1b5f9f:assets/mullvad-rotate.sh 2>/dev/null; then
+        skip "a1b5f9f not available in this clone (shallow CI clone); regression guard skipped"
+    fi
     git -C "$REPO" show a1b5f9f:assets/mullvad-rotate.sh | \
         sed -e 's/^CHECK_TIMEOUT=[0-9]*/CHECK_TIMEOUT=2/' \
             -e 's/^TUNNEL_SETTLE=[0-9]*/TUNNEL_SETTLE=0/' \
@@ -230,6 +233,9 @@ setup_watchdog() {
     export MULLVAD_KILLSWITCH_RULES
     
     local old_script="$BATS_TEST_TMPDIR/old_rotate.sh"
+    if ! git -C "$REPO" cat-file -e a1b5f9f:assets/mullvad-rotate.sh 2>/dev/null; then
+        skip "a1b5f9f not available in this clone (shallow CI clone); regression guard skipped"
+    fi
     git -C "$REPO" show a1b5f9f:assets/mullvad-rotate.sh | \
         sed -e 's/^CHECK_TIMEOUT=[0-9]*/CHECK_TIMEOUT=2/' \
             -e 's/^TUNNEL_SETTLE=[0-9]*/TUNNEL_SETTLE=0/' \
@@ -259,6 +265,9 @@ setup_watchdog() {
     export MULLVAD_KILLSWITCH_RULES
     
     local old_script="$BATS_TEST_TMPDIR/old_rotate.sh"
+    if ! git -C "$REPO" cat-file -e a1b5f9f:assets/mullvad-rotate.sh 2>/dev/null; then
+        skip "a1b5f9f not available in this clone (shallow CI clone); regression guard skipped"
+    fi
     git -C "$REPO" show a1b5f9f:assets/mullvad-rotate.sh | \
         sed -e 's/^CHECK_TIMEOUT=[0-9]*/CHECK_TIMEOUT=2/' \
             -e 's/^TUNNEL_SETTLE=[0-9]*/TUNNEL_SETTLE=0/' \

@@ -16,3 +16,9 @@ tailscale status --json
 tailscale status --json
 tailscale exit-node list
 tailscale set --exit-node=us-nyc-wg-001.mullvad.ts.net --exit-node-allow-lan-access=true
+tailscale status --json
+tailscale exit-node list
+tailscale status --json
+tailscale status --json
+tailscale exit-node list
+tailscale set --exit-node=us-nyc-wg-001.mullvad.ts.net --exit-node-allow-lan-access=true
