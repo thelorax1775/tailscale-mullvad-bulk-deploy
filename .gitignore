@@ -2,9 +2,6 @@
 bulkvpn-*.log
 *.log
 
-# Test artifacts
-.tailscale
-
 # Editor / OS cruft
 *.swp
 *~

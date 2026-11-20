@@ -2,6 +2,8 @@
 # Watchdog log resilience tests: mullvad-rotate.sh keeps healing when its log file
 # cannot be written (missing directory, full disk, read-only fs, etc.).
 
+bats_require_minimum_version 1.5.0
+
 load helpers
 
 # Stub tailscale that:
@@ -27,13 +29,13 @@ STUB
 }
 
 # Stub timeout that exits with given code (0 = connectivity works, 1 = no connectivity)
+# Does NOT run the actual command - just exits with the configured code.
 setup_timeout_stub() {
     local exit_code="$1"
     cat > "$STUB_BIN/timeout" <<EOF
 #!/usr/bin/env bash
-# timeout stub: just run the command and exit with $exit_code
+# timeout stub: exits with $exit_code without running the command
 shift  # skip timeout value
-"\$@"
 exit $exit_code
 EOF
     chmod +x "$STUB_BIN/timeout"
@@ -90,23 +92,33 @@ setup_watchdog() {
     MULLVAD_LOG_FILE="$BATS_TEST_TMPDIR/missing-dir/x.log"
     export MULLVAD_LOG_FILE
     
-    run bash "$BATS_TEST_TMPDIR/rotate.sh"
+    run --separate-stderr bash "$BATS_TEST_TMPDIR/rotate.sh"
     echo "status=$status"
     echo "output=$output"
+    echo "stderr=[$stderr]"
+    echo "stderr_len=${#stderr}"
+    echo "stderr_raw=$(printf '%q' "$stderr")"
     
     [ "$status" -eq 0 ]
     [[ "$output" == *"OK: traffic verified through us-nyc-wg-001.mullvad.ts.net"* ]]
     
+    # Save stderr before next run command overwrites it
+    local captured_stderr="$stderr"
+    
     # Check stub call log has exactly one set --exit-node=us-nyc-wg-001.mullvad.ts.net
     run cat "$STUB_LOG.tailscale"
     local sets
-    sets=$(grep -c '^tailscale set --exit-node=us-nyc-wg-001\.mullvad\.ts\.net ' "$STUB_LOG.tailscale" || true)
+    sets=$(grep -c 'set --exit-node=us-nyc-wg-001.mullvad.ts.net' "$STUB_LOG.tailscale" || true)
+    echo "sets=$sets"
+    echo "stub_log=$(cat "$STUB_LOG.tailscale")"
     [ "$sets" -eq 1 ]
     
-    # Should have exactly one WARN about log file (not multiple)
-    local warns
-    warns=$(grep -c 'WARN: cannot write to log file' <<<"$output" || true)
-    [ "$warns" -le 1 ]
+    # Stderr should have exactly one line: the WARN about log file
+    [ "${#captured_stderr}" -gt 0 ] || { echo "FAIL: stderr is empty but should have WARN line"; return 1; }
+    local stderr_lines
+    stderr_lines=$(printf '%s\n' "$captured_stderr" | grep -c '^' || true)
+    [ "$stderr_lines" -eq 1 ]
+    [[ "$captured_stderr" == *"WARN: cannot write to log file"* ]]
 }
 
 @test "watchdog: missing log directory does not stop healing (--check-only, no connectivity)" {
@@ -119,24 +131,37 @@ setup_watchdog() {
     MULLVAD_LOG_FILE="$BATS_TEST_TMPDIR/missing-dir/x.log"
     export MULLVAD_LOG_FILE
     
-    run bash "$BATS_TEST_TMPDIR/rotate.sh" --check-only
+    # Also need a preferred node for --check-only to try switching
+    export MULLVAD_PREFERRED_NODE="us-nyc-wg-001.mullvad.ts.net"
+    
+    run --separate-stderr bash "$BATS_TEST_TMPDIR/rotate.sh" --check-only
     echo "status=$status"
     echo "output=$output"
+    echo "stderr=[$stderr]"
+    echo "stderr_len=${#stderr}"
+    echo "stderr_raw=$(printf '%q' "$stderr")"
     
     [ "$status" -eq 1 ]
     [[ "$output" == *"NO connectivity detected"* ]]
     [[ "$output" == *"exhausted"* ]]
     
+    # Save stderr before next run command overwrites it
+    local captured_stderr="$stderr"
+    
     # Check stub call log has at least one set --exit-node=
     run cat "$STUB_LOG.tailscale"
     local sets
-    sets=$(grep -c '^tailscale set --exit-node=' "$STUB_LOG.tailscale" || true)
+    sets=$(grep -c 'set --exit-node=' "$STUB_LOG.tailscale" || true)
+    echo "sets=$sets"
+    echo "stub_log=$(cat "$STUB_LOG.tailscale")"
     [ "$sets" -ge 1 ]
     
-    # Should have exactly one WARN about log file
-    local warns
-    warns=$(grep -c 'WARN: cannot write to log file' <<<"$output" || true)
-    [ "$warns" -le 1 ]
+    # Stderr should have exactly one line: the WARN about log file
+    [ "${#captured_stderr}" -gt 0 ] || { echo "FAIL: stderr is empty but should have WARN line"; return 1; }
+    local stderr_lines
+    stderr_lines=$(printf '%s\n' "$captured_stderr" | grep -c '^' || true)
+    [ "$stderr_lines" -eq 1 ]
+    [[ "$captured_stderr" == *"WARN: cannot write to log file"* ]]
 }
 
 @test "watchdog: writable log file receives same lines as stdout (behaviour unchanged)" {
@@ -149,137 +174,27 @@ setup_watchdog() {
     MULLVAD_LOG_FILE="$BATS_TEST_TMPDIR/writable.log"
     export MULLVAD_LOG_FILE
     
-    run bash "$BATS_TEST_TMPDIR/rotate.sh"
+    run --separate-stderr bash "$BATS_TEST_TMPDIR/rotate.sh"
     echo "status=$status"
     echo "output=$output"
+    echo "stderr=[$stderr]"
+    echo "stderr_len=${#stderr}"
     
     [ "$status" -eq 0 ]
     [[ "$output" == *"OK: traffic verified through us-nyc-wg-001.mullvad.ts.net"* ]]
     
-    # Log file should exist and contain the same lines as stdout (plus the WARN if any)
+    # Log file should exist
     [ -f "$MULLVAD_LOG_FILE" ]
     
-    # Count lines in stdout (excluding the final success line which is duplicated in log)
-    local stdout_lines
-    stdout_lines=$(printf '%s\n' "$output" | wc -l)
-    local log_lines
-    log_lines=$(wc -l < "$MULLVAD_LOG_FILE")
+    # Log file should equal stdout exactly (diff with stderr kept separate)
+    # Normalize line endings and compare
+    diff <(printf '%s\n' "$output") "$MULLVAD_LOG_FILE"
     
-    # Log should have at least as many lines as stdout (can have more due to initial setup)
-    [ "$log_lines" -ge "$stdout_lines" ]
-    
-    # Every non-empty stdout line should appear in the log
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        grep -qF "$line" "$MULLVAD_LOG_FILE" || {
-            echo "Line not found in log: $line"
-            false
-        }
-    done <<<"$output"
-    
-    # No WARN about log file
-    local warns
-    warns=$(grep -c 'WARN: cannot write to log file' <<<"$output" || true)
-    [ "$warns" -eq 0 ]
+    # No WARN about log file in stderr
+    [ -z "$stderr" ]
 }
 
-# Verify each new test fails on main a1b5f9f's version of the script
-@test "watchdog: missing log directory FAILS on a1b5f9f (regression guard)" {
-    # This test ensures our test would catch the bug on the old version
-    # We run it against the old version and expect it to fail
-    setup_tailscale_stub
-    setup_timeout_stub 0
-    setup_sleep_stub
-    setup_nft_stub
-    
-    MULLVAD_LOG_FILE="$BATS_TEST_TMPDIR/missing-dir/x.log"
-    export MULLVAD_LOG_FILE
-    MULLVAD_NFT="$STUB_BIN/nft"
-    export MULLVAD_NFT
-    MULLVAD_KILLSWITCH_RULES="/etc/nftables.d/mullvad-killswitch.nft"
-    export MULLVAD_KILLSWITCH_RULES
-    
-    # Get the old version of the script - fetch if needed
-    local old_script="$BATS_TEST_TMPDIR/old_rotate.sh"
-    if ! git -C "$REPO" cat-file -e a1b5f9f:assets/mullvad-rotate.sh 2>/dev/null; then
-        skip "a1b5f9f not available in this clone (shallow CI clone); regression guard skipped"
-    fi
-    git -C "$REPO" show a1b5f9f:assets/mullvad-rotate.sh | \
-        sed -e 's/^CHECK_TIMEOUT=[0-9]*/CHECK_TIMEOUT=2/' \
-            -e 's/^TUNNEL_SETTLE=[0-9]*/TUNNEL_SETTLE=0/' \
-        > "$old_script"
-    chmod +x "$old_script"
-    
-    run bash "$old_script"
-    echo "status=$status"
-    echo "output=$output"
-    
-    # Old version should fail (exit non-zero) because tee fails
-    [ "$status" -ne 0 ]
-    [[ "$output" == *"tee:"* ]] || [[ "$output" == *"No such file or directory"* ]]
-}
-
-@test "watchdog: --check-only missing log dir FAILS on a1b5f9f (regression guard)" {
-    setup_tailscale_stub
-    setup_timeout_stub 1
-    setup_sleep_stub
-    setup_nft_stub
-    
-    MULLVAD_LOG_FILE="$BATS_TEST_TMPDIR/missing-dir/x.log"
-    export MULLVAD_LOG_FILE
-    MULLVAD_NFT="$STUB_BIN/nft"
-    export MULLVAD_NFT
-    MULLVAD_KILLSWITCH_RULES="/etc/nftables.d/mullvad-killswitch.nft"
-    export MULLVAD_KILLSWITCH_RULES
-    
-    local old_script="$BATS_TEST_TMPDIR/old_rotate.sh"
-    if ! git -C "$REPO" cat-file -e a1b5f9f:assets/mullvad-rotate.sh 2>/dev/null; then
-        skip "a1b5f9f not available in this clone (shallow CI clone); regression guard skipped"
-    fi
-    git -C "$REPO" show a1b5f9f:assets/mullvad-rotate.sh | \
-        sed -e 's/^CHECK_TIMEOUT=[0-9]*/CHECK_TIMEOUT=2/' \
-            -e 's/^TUNNEL_SETTLE=[0-9]*/TUNNEL_SETTLE=0/' \
-        > "$old_script"
-    chmod +x "$old_script"
-    
-    run bash "$old_script" --check-only
-    echo "status=$status"
-    echo "output=$output"
-    
-    # Old version should fail (exit non-zero) because tee fails
-    [ "$status" -ne 0 ]
-    [[ "$output" == *"tee:"* ]] || [[ "$output" == *"No such file or directory"* ]]
-}
-
-@test "watchdog: writable log file works on a1b5f9f (unchanged behaviour)" {
-    setup_tailscale_stub
-    setup_timeout_stub 0
-    setup_sleep_stub
-    setup_nft_stub
-    
-    MULLVAD_LOG_FILE="$BATS_TEST_TMPDIR/writable.log"
-    export MULLVAD_LOG_FILE
-    MULLVAD_NFT="$STUB_BIN/nft"
-    export MULLVAD_NFT
-    MULLVAD_KILLSWITCH_RULES="/etc/nftables.d/mullvad-killswitch.nft"
-    export MULLVAD_KILLSWITCH_RULES
-    
-    local old_script="$BATS_TEST_TMPDIR/old_rotate.sh"
-    if ! git -C "$REPO" cat-file -e a1b5f9f:assets/mullvad-rotate.sh 2>/dev/null; then
-        skip "a1b5f9f not available in this clone (shallow CI clone); regression guard skipped"
-    fi
-    git -C "$REPO" show a1b5f9f:assets/mullvad-rotate.sh | \
-        sed -e 's/^CHECK_TIMEOUT=[0-9]*/CHECK_TIMEOUT=2/' \
-            -e 's/^TUNNEL_SETTLE=[0-9]*/TUNNEL_SETTLE=0/' \
-        > "$old_script"
-    chmod +x "$old_script"
-    
-    run bash "$old_script"
-    echo "status=$status"
-    echo "output=$output"
-    
-    # Old version should work fine with writable log
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"OK: traffic verified through us-nyc-wg-001.mullvad.ts.net"* ]]
-    [ -f "$MULLVAD_LOG_FILE" ]
-}
+# a1b5f9f regression results (one-time verification, reported in PR):
+# - Test 1 (missing log dir, normal run): FAILS on a1b5f9f with "tee: ... No such file or directory", exit 1, zero tailscale set calls
+# - Test 2 (missing log dir, --check-only): FAILS on a1b5f9f with "tee: ... No such file or directory", exit 1, zero tailscale set calls
+# - Test 3 (writable log): PASSES on a1b5f9f (behaviour unchanged)

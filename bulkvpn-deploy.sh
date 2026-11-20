@@ -181,7 +181,8 @@ log() {
     msg="$(date '+%Y-%m-%d %H:%M:%S')  $*"
     printf '%s\n' "$msg"
     # Best-effort append to log file; on failure, warn once and continue.
-    if ! $LOG_WARNED && ! printf '%s\n' "$msg" >> "$LOG_FILE" 2>/dev/null; then
+    # Wrap in { ... } 2>/dev/null so bash's own redirect error is suppressed.
+    if ! $LOG_WARNED && ! { printf '%s\n' "$msg" >> "$LOG_FILE"; } 2>/dev/null; then
         LOG_WARNED=true
         printf 'WARN: cannot write to log file %s — continuing with stdout only\n' "$LOG_FILE" >&2
     fi
