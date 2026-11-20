@@ -4,6 +4,31 @@
 
 ### Fixed
 
+- Kill-switch `forward` chain: a physical uplink named like a container bridge
+  (`br-*`, `docker*`, `podman*`, `cni*`) no longer opens forwarded traffic. The
+  plain `oifname "br-*" accept` is replaced by three narrow accepts for those
+  names: `ct direction reply`, `ct status dnat` (published ports) and
+  bridge-to-bridge traffic to private addresses. Reproduced with the leak rig
+  run with `BULKVPN_LEAK_PHYS=br-up`: after the route was removed 4 packets
+  (masquerade) and 30 packets (SNAT, 29 from 100.64/10) left the uplink; a new
+  container connection to an internet address leaked 3 packets; 0 after the fix.
+  The two forwarded cases are no longer skipped in the br-up run; new cases
+  cover a container's new connection, a published port (LAN -> DNAT ->
+  container, replies) and container-to-container across two bridges. Already-
+  protected guests need `FORCE_REDEPLOY=1` to receive the fix.
+  Follow-ups from review: the ruleset no longer puts wildcard interface names
+  inside anonymous sets (nft 1.0.2 / Ubuntu 22.04 failed to load the whole file
+  with "Byteorder mismatch"; a bats test guards it); `tailscale0` -> container
+  (subnet router) keeps working, with a rig case; replies of DNATed connections
+  no longer leave a br-* uplink (`ct status ! dnat`), with a rig case; the
+  forward-chain comment about `ct direction reply` was inverted and is fixed.
+  Documented, not fixed: on a br-* uplink a container's new connection to a
+  private non-LAN address still leaves the uplink, and a LAN host with a static
+  route to the container subnet is not allowed (add it to `MULLVAD_LAN_SUBNET`).
+- README: on a `br-*`-named uplink `output`'s `ct direction reply` accepts let
+  the guest's replies to inbound connections from outside the LAN set leave the
+  uplink; the caveat now says so instead of claiming they are dropped.
+
 - Enrolling a container no longer writes the `/dev/net/tun` passthrough lines
   into a snapshot. A CT config is the current settings followed by one
   `[name]` section per snapshot, and the lines were appended to the end of the
@@ -54,9 +79,9 @@
 - Kill-switch `output` chain now accepts packets for local container bridges
   (`docker*`, `br-*`, `podman*`, `cni*`), reply direction only (`ct direction
   reply`), so a guest's own replies to a container keep working without the
-  established/related rule. Known limitation: on a guest whose physical uplink
-  is named like one of these, the `forward` chain's plain accept still applies
-  (see README).
+  established/related rule. On a guest whose physical uplink is named like
+  one of these, replies to outside-LAN inbound connections still leave it (see
+  README).
 
 ### Added
 

@@ -365,8 +365,9 @@ table inet mullvad_killswitch {
         # set. Direction (not conntrack state) is what keeps this safe: a flow
         # the guest opened through the tunnel is direction "original", so it
         # never matches here, even if it is re-routed onto an uplink whose name
-        # happens to match br-*. (Such an uplink still gets the plain "br-*"
-        # accept in chain forward; see the README caveats.)
+        # happens to match br-*. On such an uplink, though, replies to an
+        # inbound connection from OUTSIDE the LAN set do leave the uplink;
+        # see the README caveats.)
         oifname "docker*" ct direction reply accept
         oifname "br-*" ct direction reply accept
         oifname "podman*" ct direction reply accept
@@ -392,10 +393,55 @@ table inet mullvad_killswitch {
 
         ip daddr $LAN accept
 
-        oifname "docker*" accept
-        oifname "br-*" accept
-        oifname "podman*" accept
-        oifname "cni*" accept
+        # Into a local container bridge, but never on the interface name
+        # alone: a guest whose physical uplink is itself called br-* (netplan /
+        # OpenStack bridged uplinks) would otherwise let forwarded container
+        # traffic leave the real NIC with the tunnel down. Narrow cases only:
+        #  - a reply to a connection the CONTAINER opened (for example out
+        #    tailscale0), coming back into the bridge. Replies of DNATed
+        #    connections are excluded: on a br-* uplink those are the answers
+        #    to an internet client of a published port and must not leave;
+        #  - a published port: the first direction of a DNATed connection;
+        #  - jump to to_bridge, below: traffic from another container bridge
+        #    or from tailscale0 to a private address.
+        # A NEW connection a container opens (original direction, not DNATed)
+        # is judged only by the rules above: out tailscale0 or to the LAN set.
+        oifname "docker*" ct direction reply ct status ! dnat accept
+        oifname "br-*" ct direction reply ct status ! dnat accept
+        oifname "podman*" ct direction reply ct status ! dnat accept
+        oifname "cni*" ct direction reply ct status ! dnat accept
+        oifname "docker*" ct direction original ct status dnat accept
+        oifname "br-*" ct direction original ct status dnat accept
+        oifname "podman*" ct direction original ct status dnat accept
+        oifname "cni*" ct direction original ct status dnat accept
+
+        # Container to container (another bridge, or the same bridge when
+        # br_netfilter is loaded), and tailscale0 to a container (a subnet
+        # router advertising the container subnet).
+        # NOTE: no wildcard interface name may sit inside an anonymous set
+        # { }: nft 1.0.2 (Ubuntu 22.04) fails the whole file with "Byteorder
+        # mismatch". Hence one jump per name and single-name rules in
+        # to_bridge. tests/assets.bats guards this.
+        iifname "docker*" jump to_bridge
+        iifname "br-*" jump to_bridge
+        iifname "podman*" jump to_bridge
+        iifname "cni*" jump to_bridge
+        iifname "tailscale0" jump to_bridge
+    }
+
+    # Only reached for packets that came in from a container bridge or
+    # tailscale0. The private-address test is what keeps a br-* *uplink* from
+    # passing public destinations. (A private non-LAN destination still passes
+    # on a br-* uplink; README: Limitation.)
+    chain to_bridge {
+        oifname "docker*" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept
+        oifname "docker*" ip6 daddr fc00::/7 accept
+        oifname "br-*" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept
+        oifname "br-*" ip6 daddr fc00::/7 accept
+        oifname "podman*" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept
+        oifname "podman*" ip6 daddr fc00::/7 accept
+        oifname "cni*" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept
+        oifname "cni*" ip6 daddr fc00::/7 accept
     }
 }
 NFT_EOF

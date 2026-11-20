@@ -283,17 +283,6 @@ while time.time() < end:
     except OSError:
         pass
     time.sleep(0.1)'
-# Known limitation, documented in the README: chain forward has a plain
-# `oifname "br-*" accept`, so on a guest whose physical uplink is itself named
-# br-* forwarded flows are not protected. The forwarded cases are therefore
-# skipped in the br-up run instead of asserting something that is not true.
-forwarded_case() {   # name  prefix
-    if [[ "$PHYS" == br-* ]]; then
-        echo "SKIP  $1 (known limitation: forward accepts oifname br-*)"
-    else
-        flow_case "$@"
-    fi
-}
 flow_case() {   # name  "command prefix that runs the client"
     local name="$1"; shift
     tunnel_up; reset
@@ -321,7 +310,7 @@ table ip nat {
 EOF2
 # With `masquerade` the kernel itself drops a flow whose output interface
 # changed, so this case passes even without the fix; it documents that.
-forwarded_case "tunnel route removed: an established forwarded (masqueraded) connection from a container does not move to the physical NIC" c
+flow_case "tunnel route removed: an established forwarded (masqueraded) connection from a container does not move to the physical NIC" c
 # A fixed `snat to` (static NAT, or a firewall that does not use masquerade)
 # has no such guard: the re-routed packets keep the Tailscale source address
 # and only the kill-switch stops them.
@@ -333,7 +322,7 @@ table ip nat {
     }
 }
 EOF2
-forwarded_case "tunnel route removed: an established forwarded (SNATed to the tailscale address) connection from a container does not move to the physical NIC" c
+flow_case "tunnel route removed: an established forwarded (SNATed to the tailscale address) connection from a container does not move to the physical NIC" c
 
 udp_send() {   # ns-prefix  family(4|6)  dst  sport  mark(0=none)  bind-device("" = none)  dport
     "$1" python3 -c 'import socket, sys
@@ -408,7 +397,10 @@ s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind((sys.argv[1], 7000))
 s.listen(1)
 s.settimeout(6)
-c, _ = s.accept()
+try:
+    c, _ = s.accept()
+except OSError:
+    sys.exit(0)
 c.settimeout(3)
 data = c.recv(100)
 c.sendall(b"pong:" + data)
@@ -468,6 +460,91 @@ if [[ "$out" != "pong:ping" ]]; then
     result ok "tunnel down: a NEW connection from the guest into the container bridge is dropped (bridge subnet is not in the LAN set)" "no answer, as documented"
 else
     result bad "tunnel down: a NEW connection from the guest into the container bridge is dropped (bridge subnet is not in the LAN set)" "the connection completed"
+fi
+
+# Forwarded traffic that must keep working with the tunnel down (the guest is a
+# Docker host), and must not become a way out of the physical NIC.
+# 1. A new connection a container opens to an internet address is dropped.
+tunnel_down; reset
+c timeout 3 bash -c 'exec 3<>/dev/tcp/203.0.113.10/443' 2>/dev/null; rc=$?
+sleep 0.3
+n="$(count phys_inet)"
+if [[ "$rc" != 0 && "$n" == 0 ]]; then
+    result ok "tunnel down: a NEW connection from a container to an internet address is dropped" "0 packets on the physical side"
+else
+    result bad "tunnel down: a NEW connection from a container to an internet address is dropped" "LEAK: $n packets on the physical side, connect rc=$rc"
+fi
+# 2. Published port: a LAN client reaches guest:7100, DNATed to the container.
+g nft -f - <<EOF2 || broken "cannot load the DNAT table"
+table ip pub {
+    chain pre { type nat hook prerouting priority -100;
+        iifname "$PHYS" tcp dport 7100 dnat to 172.17.0.2:7000
+    }
+}
+EOF2
+c python3 -c "$INBOUND_SERVER" 172.17.0.2 &
+sp=$!
+sleep 0.5
+out="$(timeout 6 python3 -c 'import socket
+s = socket.create_connection(("192.168.50.2", 7100), timeout=3, source_address=("192.168.50.1", 0))
+s.sendall(b"ping"); s.settimeout(3); print(s.recv(100).decode())' 2>&1)"
+kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+if [[ "$out" == "pong:ping" ]]; then
+    result ok "tunnel down: a published port (LAN -> DNAT -> container) works and the replies come back" "ping answered with pong"
+else
+    result bad "tunnel down: a published port (LAN -> DNAT -> container) works and the replies come back" "got: ${out:-nothing}"
+fi
+# 2b. The answers to an INTERNET client of a published port go out the uplink,
+# not the tunnel: with the tunnel down they must be dropped (as on eth0). On a
+# br-* uplink the bridge-name accepts used to let them leave (client got a RST).
+c python3 -c "$INBOUND_SERVER" 172.17.0.2 &
+sp=$!
+sleep 0.5
+reset
+timeout 4 python3 -c 'import socket
+s = socket.create_connection(("192.168.50.2", 7100), timeout=2, source_address=("203.0.113.10", 0))' >/dev/null 2>&1
+sleep 0.3
+n="$(count phys_inet)"
+kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+if [[ "$n" == 0 ]]; then
+    result ok "tunnel down: replies to an internet client of a published port do not leave the uplink" "0 packets on the physical side"
+else
+    result bad "tunnel down: replies to an internet client of a published port do not leave the uplink" "LEAK: $n packets on the physical side"
+fi
+# 2c. Subnet router: a tunnel peer reaches a container IP directly (no DNAT)
+# while the tunnel is up.
+tunnel_up
+ip route add 172.17.0.0/24 via 100.64.0.2 dev wts 2>/dev/null
+c python3 -c "$INBOUND_SERVER" 172.17.0.2 &
+sp=$!
+sleep 0.5
+out="$(timeout 6 python3 -c "$INBOUND_CLIENT" 100.64.0.1 172.17.0.2 2>&1)"
+kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+if [[ "$out" == "pong:ping" ]]; then
+    result ok "tunnel up: a tunnel peer reaches a container IP directly (subnet router, no DNAT)" "ping answered with pong"
+else
+    result bad "tunnel up: a tunnel peer reaches a container IP directly (subnet router, no DNAT)" "got: ${out:-nothing}"
+fi
+tunnel_down
+# 3. Container to container on two bridges (docker0 and br-app), through the guest.
+g ip link add br-app type veth peer name c2veth netns C2 2>/dev/null || { ip netns add C2 && g ip link add br-app type veth peer name c2veth netns C2; } || broken "cannot create the second container bridge"
+g ip addr add 172.18.0.1/24 dev br-app
+g ip link set br-app up
+g sysctl -qw net.ipv4.conf.br-app.rp_filter=0 2>/dev/null
+c2() { ip netns exec C2 "$@"; }
+c2 ip link set lo up
+c2 ip addr add 172.18.0.2/24 dev c2veth
+c2 ip link set c2veth up
+c2 ip route add default via 172.18.0.1
+c2 python3 -c "$INBOUND_SERVER" 172.18.0.2 &
+sp=$!
+sleep 0.5
+out="$(c timeout 6 python3 -c "$INBOUND_CLIENT" 172.17.0.2 172.18.0.2 2>&1)"
+kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+if [[ "$out" == "pong:ping" ]]; then
+    result ok "tunnel down: container to container across two bridges works" "ping answered with pong"
+else
+    result bad "tunnel down: container to container across two bridges works" "got: ${out:-nothing}"
 fi
 
 ### ---- the watchdog restores a kill-switch table that something removed -------
