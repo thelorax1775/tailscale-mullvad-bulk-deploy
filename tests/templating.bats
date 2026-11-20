@@ -248,3 +248,54 @@ render_nft() {
     [[ "$calls" != *"base64 -d > '/usr/local/bin/mullvad-rotate.sh'"* ]]
     [[ "$calls" != *"base64 -d > '/etc/nftables.d/mullvad-killswitch.nft'"* ]]
 }
+
+@test "deploy_killswitch: pushed rotate payload matches rotate_templated output byte for byte including trailing newline" {
+    stub_setup
+    fixture_lxc '[{"vmid":101,"status":"running","name":"ct101"}]'
+    # Set special character values to test literal preservation
+    export MULLVAD_COUNTRY_FILTER="Bosnia & Herzegovina"
+    export MULLVAD_PREFERRED_NODE="a|b"
+    export MULLVAD_LAN_AUTODETECT=0
+    export MULLVAD_LAN_INCLUDE_GUESTS=0
+    export MULLVAD_LAN_SUBNET="192.168.10.0/24"
+    
+    # Get the expected rendered output (with trailing newline)
+    local expected_file="$BATS_TEST_TMPDIR/expected_rotate"
+    # shellcheck source=/dev/null
+    BULKVPN_LIB_ONLY=1 source "$SCRIPT"
+    rotate_templated "192.168.10.0/24" > "$expected_file"
+
+    run bash -c '
+        BULKVPN_LIB_ONLY=1 source "$0"
+        deploy_killswitch lxc 101 "ct/101 (ct101)"
+    ' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    
+    # Get the actual pushed payload from the stub log
+    local calls
+    calls=$(calls_log)
+    # Extract the base64 payload for mullvad-rotate.sh
+    # The log contains: printf '%s\n' 'BASE64' | base64 -d
+    local b64_payload
+    b64_payload=$(printf '%s\n' "$calls" | grep "base64 -d > '/usr/local/bin/mullvad-rotate.sh'" | sed "s/.*printf '%s[^']*' '\([^']*\)'.*/\1/")
+    [ -n "$b64_payload" ]
+    local actual_file="$BATS_TEST_TMPDIR/actual_rotate"
+    printf '%s\n' "$b64_payload" | base64 -d > "$actual_file"
+    
+    # Compare byte for byte using cmp (preserves trailing newline)
+    cmp "$expected_file" "$actual_file"
+    
+    # Also check nft payload
+    local expected_nft="$BATS_TEST_TMPDIR/expected_nft"
+    # shellcheck source=/dev/null
+    BULKVPN_LIB_ONLY=1 source "$SCRIPT"
+    nft_templated "{ 192.168.10.0/24 }" > "$expected_nft"
+    
+    local b64_nft
+    b64_nft=$(printf '%s\n' "$calls" | grep "base64 -d > '/etc/nftables.d/mullvad-killswitch.nft'" | sed "s/.*printf '%s[^']*' '\([^']*\)'.*/\1/")
+    [ -n "$b64_nft" ]
+    local actual_nft="$BATS_TEST_TMPDIR/actual_nft"
+    printf '%s\n' "$b64_nft" | base64 -d > "$actual_nft"
+    
+    cmp "$expected_nft" "$actual_nft"
+}

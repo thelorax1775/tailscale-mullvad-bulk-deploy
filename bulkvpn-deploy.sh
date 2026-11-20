@@ -828,8 +828,8 @@ deploy_killswitch() {   # engine id label
     [[ -n "$nft_ruleset" ]] || { log "  [$label] FAILED: rendered nft ruleset is empty"; return 1; }
 
     log "  [$label] pushing kill-switch assets"
-    printf '%s' "$rotate_script" | push_file "$engine" "$id" /usr/local/bin/mullvad-rotate.sh 755 || return 1
-    printf '%s' "$nft_ruleset"   | push_file "$engine" "$id" /etc/nftables.d/mullvad-killswitch.nft 644 || return 1
+    printf '%s\n' "$rotate_script" | push_file "$engine" "$id" /usr/local/bin/mullvad-rotate.sh 755 || return 1
+    printf '%s\n' "$nft_ruleset"   | push_file "$engine" "$id" /etc/nftables.d/mullvad-killswitch.nft 644 || return 1
     asset_killswitch_service    | push_file "$engine" "$id" /etc/systemd/system/mullvad-killswitch.service 644 || return 1
     asset_healthcheck_service   | push_file "$engine" "$id" /etc/systemd/system/mullvad-healthcheck.service 644 || return 1
     asset_healthcheck_timer     | push_file "$engine" "$id" /etc/systemd/system/mullvad-healthcheck.timer 644 || return 1
