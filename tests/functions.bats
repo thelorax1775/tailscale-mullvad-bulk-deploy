@@ -122,6 +122,82 @@ IN
     [ -z "$output" ]
 }
 
+# ---- resolve_lan_list --------------------------------------------------------
+
+@test "resolve_lan_list: guest auto-detected non-private subnets are ignored and logged" {
+    stub_setup
+    # Mock run_guest to return non-private + private subnets
+    # The stub pct exec will run CMD_DETECT_LAN
+    fixture_lxc '[{"vmid":101,"status":"running","name":"web"}]'
+    # We need to override the stub's guest_cmd to handle CMD_DETECT_LAN
+    # Instead, let's test the logic directly using libsh
+    MULLVAD_LAN_AUTODETECT=1 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="" run libsh '
+        run_guest() { echo "0.0.0.0/1 128.0.0.0/1 192.168.10.0/24"; }
+        resolve_lan_list lxc 101
+    '
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"192.168.10.0/24" ]]
+    [[ "$output" == *"ignoring non-private subnet(s): 0.0.0.0/1 128.0.0.0/1"* ]]
+}
+
+@test "resolve_lan_list: only non-private auto-detected subnets falls back to RFC1918" {
+    stub_setup
+    fixture_lxc '[{"vmid":101,"status":"running","name":"web"}]'
+    MULLVAD_LAN_AUTODETECT=1 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="" run libsh '
+        run_guest() { echo "0.0.0.0/1 128.0.0.0/1"; }
+        resolve_lan_list lxc 101
+    '
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"10.0.0.0/8"* ]]
+    [[ "$output" == *"172.16.0.0/12"* ]]
+    [[ "$output" == *"192.168.0.0/16"* ]]
+    # The last line of output should be the subnet list (no 0.0.0.0/1 or 128.0.0.0/1)
+    last_line="$(printf '%s\n' "$output" | tail -n1)"
+    [[ "$last_line" != *"0.0.0.0/1"* ]]
+    [[ "$last_line" != *"128.0.0.0/1"* ]]
+    [[ "$output" == *"ignoring non-private subnet(s): 0.0.0.0/1 128.0.0.0/1"* ]]
+}
+
+@test "resolve_lan_list: MULLVAD_LAN_SUBNET invalid CIDR /0 exits non-zero" {
+    stub_setup
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="0.0.0.0/0" run libsh '
+        resolve_lan_list lxc 101
+    '
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"MULLVAD_LAN_SUBNET"* ]]
+    [[ "$output" == *"0.0.0.0/0"* ]]
+}
+
+@test "resolve_lan_list: MULLVAD_LAN_SUBNET invalid prefix /33 exits non-zero" {
+    stub_setup
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="10.0.0.0/33" run libsh '
+        resolve_lan_list lxc 101
+    '
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"MULLVAD_LAN_SUBNET"* ]]
+    [[ "$output" == *"10.0.0.0/33"* ]]
+}
+
+@test "resolve_lan_list: MULLVAD_LAN_SUBNET invalid format exits non-zero" {
+    stub_setup
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="foo/24" run libsh '
+        resolve_lan_list lxc 101
+    '
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"MULLVAD_LAN_SUBNET"* ]]
+    [[ "$output" == *"foo/24"* ]]
+}
+
+@test "resolve_lan_list: valid MULLVAD_LAN_SUBNET entries work (incl. non-private)" {
+    stub_setup
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="10.0.10.0/24, 203.0.113.0/24" run libsh '
+        resolve_lan_list lxc 101
+    '
+    [ "$status" -eq 0 ]
+    # sort -u order: 10.0.10.0/24 comes before 203.0.113.0/24
+    [ "$output" = "10.0.10.0/24 203.0.113.0/24" ]
+}
+
 # ---- lan_nft_set -------------------------------------------------------------
 
 @test "lan_nft_set: several subnets become an nft set literal" {
