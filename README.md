@@ -199,9 +199,10 @@ Every run writes a timestamped log to `/root/bulkvpn-<timestamp>.log` and prints
 - **`nftables.service` interaction.** `mullvad-killswitch.service` declares `After=`, `PartOf=` and `ReloadPropagatedFrom=nftables.service` plus an `ExecReload=` that loads the ruleset, so a restart or reload of `nftables.service` re-applies the kill-switch immediately instead of at the next watchdog run (up to 15 minutes later). Guests without `nftables.service` are unaffected. This unit behaviour has not been exercised on a running systemd; the tests check the unit text only.
 - **Already-protected guests need `FORCE_REDEPLOY=1`** to receive the new watchdog and unit. A guest whose table is currently missing is no longer treated as already protected and is deployed to by a plain run.
 
-- **DNS lookups do not go through the tunnel.** The tool does not change the guest's DNS resolver (it does not modify `/etc/resolv.conf` or enable Tailscale DNS). The LAN set is a set of subnets; the kill-switch allows all traffic to those subnets, port 53 included, so DNS lookups sent to a resolver inside the LAN set go directly and are not routed through the exit node.
-- **This DNS behavior is by design:** all LAN-set traffic bypasses the tunnel, not only DNS.
-- **DNS resolver choice:** to send DNS lookups through the tunnel, point the guest at a resolver whose address is not in the LAN set; it is then reached through the exit node like any other traffic. **This DNS path goes through the Mullvad exit node.**
+- **DNS lookups do not go through the tunnel.** The tool does not change the guest's DNS resolver
+  (it does not modify `/etc/resolv.conf` or enable Tailscale DNS). The kill-switch allows all traffic to the LAN set (a set of subnets, port 53 included), so DNS
+  lookups sent to a resolver inside the LAN set go directly and are not routed through the exit node. To send DNS lookups through the tunnel,
+  point the guest at a resolver whose address is not in the LAN set; it is then reached through the exit node like any other traffic.
 
 ## Caveats
 
