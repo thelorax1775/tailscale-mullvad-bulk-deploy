@@ -73,6 +73,8 @@ ip link set weth up
 ip link set wts up
 ip link set inet0 up
 ip addr add 203.0.113.10/32 dev inet0
+ip addr add 1.1.1.1/32 dev inet0     # the rotate script's connectivity probes
+ip addr add 9.9.9.9/32 dev inet0
 ip -6 addr add 2001:db8::10/128 dev inet0 nodad
 ip -6 addr add fd50::1/64 dev weth nodad
 ip route add 100.64.0.2/32 dev wts
@@ -121,6 +123,8 @@ table inet watch {
     counter phys_dhcp {}
     counter phys_tsrc {}
     counter tun_in_reply {}
+    counter phys_probe {}
+    counter tun_probe {}
     chain pre { type filter hook prerouting priority -300;
         iifname "weth" ip daddr 203.0.113.10 counter name phys_inet
         iifname "weth" ip6 daddr 2001:db8::10 counter name phys_inet6
@@ -131,6 +135,8 @@ table inet watch {
         iifname "weth" udp sport 68 udp dport 67 ip daddr 255.255.255.255 counter name phys_dhcp
         iifname "weth" ip saddr 100.64.0.0/10 counter name phys_tsrc
         iifname "wts" ip saddr 100.64.0.2 ip daddr 100.64.0.1 counter name tun_in_reply
+        iifname "weth" ip daddr { 1.1.1.1, 9.9.9.9 } counter name phys_probe
+        iifname "wts" ip daddr { 1.1.1.1, 9.9.9.9 } counter name tun_probe
     }
 }
 EOF
@@ -162,7 +168,7 @@ def hold(ip, port):          # accepts, then reads until the peer goes away
     while True:
         c, _ = s.accept()
         threading.Thread(target=drain, args=(c,), daemon=True).start()
-for ip in ("203.0.113.10", "192.168.50.1"):
+for ip in ("203.0.113.10", "192.168.50.1", "1.1.1.1", "9.9.9.9"):
     threading.Thread(target=serve, args=(ip,), daemon=True).start()
 threading.Thread(target=hold, args=("203.0.113.10", 8443), daemon=True).start()
 time.sleep(300)
@@ -539,6 +545,75 @@ if [[ "$out" == "pong:ping" ]]; then
     result ok "tunnel down: container to container across two bridges works" "ping answered with pong"
 else
     result bad "tunnel down: container to container across two bridges works" "got: ${out:-nothing}"
+fi
+
+### ---- the watchdog restores a kill-switch table that something removed -------
+# Runs the REAL assets/mullvad-rotate.sh (only the log path, the ruleset path and
+# the two sleep/timeout settings are changed) with a stub `tailscale`. The stub
+# records every call; `set --exit-node=X` brings the fake tunnel up, like a
+# successful exit-node switch does.
+mkdir -p /run/rig/bin /run/rig/etc
+cat > /run/rig/bin/tailscale <<'STUB'
+#!/usr/bin/env bash
+echo "tailscale $*" >> /run/rig/tailscale.calls
+case "${1:-}" in
+    status) echo '{}' ;;
+    exit-node) echo "100.64.9.9  us-bos-wg-001.mullvad.ts.net  USA  Boston  -" ;;
+    set) case "${2:-}" in --exit-node=?*) ip route replace default dev tailscale0 table 52 ;; esac ;;
+esac
+exit 0
+STUB
+chmod +x /run/rig/bin/tailscale
+sed -e 's/^CHECK_TIMEOUT=[0-9]*/CHECK_TIMEOUT=2/' -e 's/^TUNNEL_SETTLE=[0-9]*/TUNNEL_SETTLE=0/' \
+    "$REPO/assets/mullvad-rotate.sh" > /run/rig/rotate.sh
+cp /run/rig/killswitch.nft /run/rig/etc/mullvad-killswitch.nft
+run_rotate() {   # args for mullvad-rotate.sh; output in /run/rig/rotate.out, status in $ROTATE_RC
+    : > /run/rig/rotate.log; : > /run/rig/tailscale.calls
+    g env PATH="/run/rig/bin:$PATH" MULLVAD_LOG_FILE=/run/rig/rotate.log \
+        MULLVAD_KILLSWITCH_RULES=/run/rig/etc/mullvad-killswitch.nft \
+        bash /run/rig/rotate.sh "$@" > /run/rig/rotate.out 2>&1
+    ROTATE_RC=$?
+}
+table_ok() { g nft list table inet mullvad_killswitch >/dev/null 2>&1; }
+reload_table() { g nft flush ruleset; g nft -f /run/rig/killswitch.nft; }
+
+# 1. table flushed away, tunnel down, ruleset file fine: reload it, heal, never say healthy.
+reload_table; tunnel_down; g nft flush ruleset; reset
+run_rotate --check-only
+p="$(count phys_probe)"; sets="$(grep -c '^tailscale set --exit-node=us-' /run/rig/tailscale.calls)"
+if table_ok && [[ "$p" == 0 && "$sets" -ge 1 ]] && grep -qi 'kill-switch table.*missing.*reload' /run/rig/rotate.log \
+   && ! grep -q 'tunnel healthy' /run/rig/rotate.out; then
+    result ok "kill-switch flushed, tunnel down: the watchdog reloads the table, heals, and does not report healthy" "table loaded again, $p probe packets on the physical side, $sets exit-node set call(s)"
+else
+    result bad "kill-switch flushed, tunnel down: the watchdog reloads the table, heals, and does not report healthy" "table loaded=$(table_ok && echo yes || echo NO), $p probe packets on the physical side, $sets exit-node set call(s), rc=$ROTATE_RC, output: $(tr '\n' '|' < /run/rig/rotate.out)"
+fi
+
+# 2. same, but the installed ruleset file is missing / invalid: fail closed, no probe.
+for variant in missing invalid; do
+    reload_table; tunnel_down; g nft flush ruleset; reset
+    if [[ "$variant" == missing ]]; then rm -f /run/rig/etc/mullvad-killswitch.nft
+    else echo 'this is not a ruleset {' > /run/rig/etc/mullvad-killswitch.nft; fi
+    run_rotate --check-only
+    p="$(count phys_probe)"; calls="$(wc -l < /run/rig/tailscale.calls)"
+    if [[ "$ROTATE_RC" != 0 && "$p" == 0 && "$calls" == 0 ]] && grep -qi 'ERROR.*kill-switch' /run/rig/rotate.log \
+       && ! grep -q 'tunnel healthy' /run/rig/rotate.out; then
+        result ok "kill-switch flushed, ruleset file $variant: exit non-zero, error names the kill-switch, no probe" "rc=$ROTATE_RC, $p probe packets on the physical side, $calls tailscale calls"
+    else
+        result bad "kill-switch flushed, ruleset file $variant: exit non-zero, error names the kill-switch, no probe" "rc=$ROTATE_RC, $p probe packets on the physical side, $calls tailscale calls, output: $(tr '\n' '|' < /run/rig/rotate.out)"
+    fi
+done
+cp /run/rig/killswitch.nft /run/rig/etc/mullvad-killswitch.nft
+
+# 3. table present and tunnel up: behaves as before, table untouched.
+reload_table; tunnel_up; reset
+before="$(g nft -a list table inet mullvad_killswitch)"
+run_rotate --check-only
+after="$(g nft -a list table inet mullvad_killswitch)"
+if [[ "$ROTATE_RC" == 0 && "$before" == "$after" && "$(grep -c 'tunnel healthy, no action' /run/rig/rotate.log)" == 1 ]] \
+   && ! grep -qi 'reload' /run/rig/rotate.log && ! grep -q '^tailscale set' /run/rig/tailscale.calls; then
+    result ok "kill-switch loaded, tunnel up: --check-only logs one 'tunnel healthy' line, no reload, table handles unchanged" "rc=0"
+else
+    result bad "kill-switch loaded, tunnel up: --check-only logs one 'tunnel healthy' line, no reload, table handles unchanged" "rc=$ROTATE_RC, table changed=$([[ "$before" == "$after" ]] && echo no || echo YES), log: $(tr '\n' '|' < /run/rig/rotate.log)"
 fi
 
 echo "leak rig: $pass passed, $fail failed"

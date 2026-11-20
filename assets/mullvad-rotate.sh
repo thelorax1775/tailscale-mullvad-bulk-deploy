@@ -28,7 +28,9 @@ ALLOW_LAN=true                 # keep LAN access to the web UI / SSH
 LAN_SUBNETS=""                 # space-separated CIDRs to keep reachable directly
                                # (off the exit-node tunnel), e.g. other guests' LANs
 LAN_BYPASS_PRIO=5200           # ip-rule priority (above Tailscale's ~5230 diverter)
-LOG_FILE="/var/log/mullvad-rotate.log"
+LOG_FILE="${MULLVAD_LOG_FILE:-/var/log/mullvad-rotate.log}"
+KILLSWITCH_RULES="${MULLVAD_KILLSWITCH_RULES:-/etc/nftables.d/mullvad-killswitch.nft}"
+NFT="${MULLVAD_NFT:-/usr/sbin/nft}"
 CHECK_TIMEOUT=8                # seconds per connectivity probe
 TUNNEL_SETTLE=3                # seconds to wait after switching before probing
 TAILSCALE="$(command -v tailscale || echo /usr/bin/tailscale)"
@@ -39,6 +41,26 @@ CHECK_ONLY=false
 
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FILE"; }
 die() { log "ERROR: $*"; exit 1; }
+
+# ensure_killswitch: the probe in verify_connectivity is only proof of a working
+# tunnel while the kill-switch table is loaded. Something else can remove it
+# (`systemctl restart nftables`, a package upgrade, `nft flush ruleset`) while
+# mullvad-killswitch.service stays "active" (oneshot, RemainAfterExit), so check
+# the table itself first, on every run, and put it back before anything else.
+# If it cannot be restored, stop: no probe, no "healthy".
+ensure_killswitch() {
+    if "$NFT" list table inet mullvad_killswitch >/dev/null 2>&1; then
+        return 0
+    fi
+    log "WARN: kill-switch table inet mullvad_killswitch is missing - reloading $KILLSWITCH_RULES"
+    [[ -r "$KILLSWITCH_RULES" ]] || die "kill-switch table is missing and the ruleset file $KILLSWITCH_RULES is not readable - cannot restore it"
+    "$NFT" -f "$KILLSWITCH_RULES" || die "kill-switch table is missing and loading $KILLSWITCH_RULES failed - cannot restore it"
+    "$NFT" list table inet mullvad_killswitch >/dev/null 2>&1 \
+        || die "kill-switch table is still missing after loading $KILLSWITCH_RULES"
+    log "kill-switch table was missing and was reloaded from $KILLSWITCH_RULES"
+}
+
+ensure_killswitch
 
 [[ -x "$TAILSCALE" ]] || die "tailscale binary not found at '$TAILSCALE'"
 
