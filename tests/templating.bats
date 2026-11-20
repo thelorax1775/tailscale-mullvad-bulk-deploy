@@ -17,10 +17,14 @@ SPECIAL_VALUES=(
     "Bosnia & Herzegovina"
     "a|b"
     "back\\slash"
-    "injection_attempt"
     "Côte d'Ivoire"
     ""
 )
+
+# Injection value for code execution test - must be constructed at runtime
+# because BATS_TEST_TMPDIR is not available at load time
+# shellcheck disable=SC2016
+INJECTION_VALUE='x"$(touch $BATS_TEST_TMPDIR/pwned)"'
 
 # Helper: render rotate_templated with given env vars and capture output
 render_rotate() {
@@ -37,26 +41,47 @@ render_nft() {
 
 @test "rotate_templated: special characters in COUNTRY_FILTER/PREFERRED_NODE are written literally and evaluate correctly" {
     local lan_subnets="192.168.10.0/24"
-    local v="Bosnia & Herzegovina"
-    # Render the templated script with V for both COUNTRY_FILTER and PREFERRED_NODE
+    for v in "${SPECIAL_VALUES[@]}"; do
+        # Render the templated script with V for both COUNTRY_FILTER and PREFERRED_NODE
+        run render_rotate "$v" "$v" "$lan_subnets"
+        [ "$status" -eq 0 ]
+        local rendered="$output"
+
+        # Extract just the COUNTRY_FILTER= and PREFERRED_NODE= lines
+        local cf_line pn_line
+        cf_line=$(printf '%s\n' "$rendered" | grep '^COUNTRY_FILTER=')
+        pn_line=$(printf '%s\n' "$rendered" | grep '^PREFERRED_NODE=')
+
+        # Run in a fresh bash using eval to properly interpret shell-quoted values
+        # (the lines are already shell-quoted with printf %q)
+        run bash -c 'eval "$1"; eval "$2"; printf "COUNTRY_FILTER=%s\n" "$COUNTRY_FILTER"; printf "PREFERRED_NODE=%s\n" "$PREFERRED_NODE"' _ "$cf_line" "$pn_line"
+        [ "$status" -eq 0 ]
+        # Both should print exactly V
+        [[ "${lines[0]}" == "COUNTRY_FILTER=$v" ]]
+        [[ "${lines[1]}" == "PREFERRED_NODE=$v" ]]
+
+        # Ensure no code execution happened (pwned file should not exist)
+        [ ! -e "$BATS_TEST_TMPDIR/pwned" ]
+    done
+}
+
+@test "rotate_templated: command substitution in value does not execute (injection attempt)" {
+    local lan_subnets="192.168.10.0/24"
+    local v="$INJECTION_VALUE"
     run render_rotate "$v" "$v" "$lan_subnets"
     [ "$status" -eq 0 ]
     local rendered="$output"
 
-    # Extract just the COUNTRY_FILTER= and PREFERRED_NODE= lines
     local cf_line pn_line
     cf_line=$(printf '%s\n' "$rendered" | grep '^COUNTRY_FILTER=')
     pn_line=$(printf '%s\n' "$rendered" | grep '^PREFERRED_NODE=')
 
-    # Run in a fresh bash using eval to properly interpret shell-quoted values
-    # (the lines are already shell-quoted with printf %q)
     run bash -c 'eval "$1"; eval "$2"; printf "COUNTRY_FILTER=%s\n" "$COUNTRY_FILTER"; printf "PREFERRED_NODE=%s\n" "$PREFERRED_NODE"' _ "$cf_line" "$pn_line"
     [ "$status" -eq 0 ]
-    # Both should print exactly V
     [[ "${lines[0]}" == "COUNTRY_FILTER=$v" ]]
     [[ "${lines[1]}" == "PREFERRED_NODE=$v" ]]
 
-    # Ensure no code execution happened (pwned file should not exist)
+    # Critical: pwned file must NOT exist - proves no code execution
     [ ! -e "$BATS_TEST_TMPDIR/pwned" ]
 }
 
