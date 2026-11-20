@@ -147,3 +147,57 @@ stray_files() {
     [[ "$output" == *"[ct/101 (flushed)] WOULD deploy"* ]]
     [[ "$output" == *"WOULD_DEPLOY=1"* ]]
 }
+
+@test "MULLVAD_LAN_SUBNET invalid /0 stops script before any guest ops (e2e)" {
+    fixture_lxc '[{"vmid":101,"status":"running","name":"web"}]'
+    fixture_qemu '[]'
+    fixture_flag ct101.mullvad
+    fixture_probe ct101 'bin=1 state=1 profile=1 svc=active backend=Running'
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="0.0.0.0/0" DRY_RUN=1 run_main
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"MULLVAD_LAN_SUBNET"* ]]
+    [[ "$output" == *"0.0.0.0/0"* ]]
+    run calls_log
+    [[ "$output" != *"pct exec"* ]]
+    [[ "$output" != *"qm guest exec"* ]]
+}
+
+@test "MULLVAD_LAN_SUBNET invalid /33 stops script before any guest ops (e2e)" {
+    fixture_lxc '[{"vmid":101,"status":"running","name":"web"}]'
+    fixture_qemu '[]'
+    fixture_flag ct101.mullvad
+    fixture_probe ct101 'bin=1 state=1 profile=1 svc=active backend=Running'
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="10.0.0.0/33" DRY_RUN=1 run_main
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"MULLVAD_LAN_SUBNET"* ]]
+    [[ "$output" == *"10.0.0.0/33"* ]]
+    run calls_log
+    [[ "$output" != *"pct exec"* ]]
+    [[ "$output" != *"qm guest exec"* ]]
+}
+
+@test "MULLVAD_LAN_SUBNET invalid format stops script before any guest ops (e2e)" {
+    fixture_lxc '[{"vmid":101,"status":"running","name":"web"}]'
+    fixture_qemu '[]'
+    fixture_flag ct101.mullvad
+    fixture_probe ct101 'bin=1 state=1 profile=1 svc=active backend=Running'
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="foo/24" DRY_RUN=1 run_main
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"MULLVAD_LAN_SUBNET"* ]]
+    [[ "$output" == *"foo/24"* ]]
+    run calls_log
+    [[ "$output" != *"pct exec"* ]]
+    [[ "$output" != *"qm guest exec"* ]]
+}
+
+@test "MULLVAD_LAN_SUBNET valid entries work end-to-end (incl. non-private)" {
+    fixture_lxc '[{"vmid":101,"status":"running","name":"web"}]'
+    fixture_qemu '[]'
+    fixture_flag ct101.mullvad
+    fixture_probe ct101 'bin=1 state=1 profile=1 svc=active backend=Running'
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="10.0.10.0/24, 203.0.113.0/24" DRY_RUN=1 run_main
+    [ "$status" -eq 0 ]
+    run calls_log
+    # Script ran and checked the guest
+    [[ "$output" == *"pct exec"* ]]
+}

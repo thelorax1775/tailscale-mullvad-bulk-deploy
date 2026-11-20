@@ -3,6 +3,8 @@
 
 load helpers
 
+bats_require_minimum_version 1.5.0
+
 # ---- ts_classify -------------------------------------------------------------
 
 @test "ts_classify: backend Running is ready" {
@@ -120,6 +122,82 @@ IN
 192.168.0.0/15
 IN
     [ -z "$output" ]
+}
+
+# ---- resolve_lan_list --------------------------------------------------------
+
+@test "resolve_lan_list: guest auto-detected non-private subnets are ignored and logged" {
+    MULLVAD_LAN_AUTODETECT=1 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="" run --separate-stderr libsh '
+        run_guest() { echo "0.0.0.0/1 128.0.0.0/1 192.168.10.0/24"; }
+        resolve_lan_list lxc 101
+    '
+    [ "$status" -eq 0 ]
+    [ "$output" = "192.168.10.0/24" ]
+    # shellcheck disable=SC2154
+    [[ "$stderr" == *"ignoring non-private subnet(s): 0.0.0.0/1 128.0.0.0/1"* ]]
+}
+
+@test "resolve_lan_list: only non-private auto-detected subnets falls back to RFC1918" {
+    MULLVAD_LAN_AUTODETECT=1 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="" run --separate-stderr libsh '
+        run_guest() { echo "0.0.0.0/1 128.0.0.0/1"; }
+        resolve_lan_list lxc 101
+    '
+    [ "$status" -eq 0 ]
+    [ "$output" = "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16" ]
+    # shellcheck disable=SC2154
+    [[ "$stderr" == *"ignoring non-private subnet(s): 0.0.0.0/1 128.0.0.0/1"* ]]
+}
+
+@test "resolve_lan_list: MULLVAD_LAN_SUBNET invalid CIDR /0 exits non-zero" {
+    stub_setup
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="0.0.0.0/0" run libsh '
+        resolve_lan_list lxc 101
+    '
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"MULLVAD_LAN_SUBNET"* ]]
+    [[ "$output" == *"0.0.0.0/0"* ]]
+}
+
+@test "resolve_lan_list: MULLVAD_LAN_SUBNET invalid prefix /33 exits non-zero" {
+    stub_setup
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="10.0.0.0/33" run libsh '
+        resolve_lan_list lxc 101
+    '
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"MULLVAD_LAN_SUBNET"* ]]
+    [[ "$output" == *"10.0.0.0/33"* ]]
+}
+
+@test "resolve_lan_list: MULLVAD_LAN_SUBNET invalid format exits non-zero" {
+    stub_setup
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="foo/24" run libsh '
+        resolve_lan_list lxc 101
+    '
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"MULLVAD_LAN_SUBNET"* ]]
+    [[ "$output" == *"foo/24"* ]]
+}
+
+@test "resolve_lan_list: valid MULLVAD_LAN_SUBNET entries work (incl. non-private)" {
+    stub_setup
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="10.0.10.0/24, 203.0.113.0/24" run libsh '
+        resolve_lan_list lxc 101
+    '
+    [ "$status" -eq 0 ]
+    # sort -u order: 10.0.10.0/24 comes before 203.0.113.0/24
+    [ "$output" = "10.0.10.0/24 203.0.113.0/24" ]
+}
+
+@test "validate_lan_extras: glob metacharacters are not expanded and are rejected with literal value" {
+    stub_setup
+    # Create a file that would match if glob expansion happened
+    touch "$BATS_TEST_TMPDIR/192.168.1.0_24"
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET="1*2.168.1.0/24" run libsh '
+        validate_lan_extras
+    '
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"MULLVAD_LAN_SUBNET"* ]]
+    [[ "$output" == *"1*2.168.1.0/24"* ]]
 }
 
 # ---- lan_nft_set -------------------------------------------------------------

@@ -10,7 +10,8 @@
 # Reload idempotently with:  nft -f /etc/nftables.d/mullvad-killswitch.nft
 #
 # Adjust LAN to match your local subnet if it isn't 192.168.1.0/24.
-# (bulkvpn-deploy.sh templates this line from MULLVAD_LAN_SUBNET.)
+# (bulkvpn-deploy.sh templates this line from resolve_lan_list: auto-detected
+# guest subnets, other guests' subnets, and MULLVAD_LAN_SUBNET extras.)
 
 define LAN = 192.168.1.0/24
 

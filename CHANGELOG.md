@@ -3,6 +3,10 @@
 ## Unreleased
 
 ### Fixed
+- Guest auto-detected LAN subnets are now filtered through `private_cidr_filter`: non-private subnets (e.g. a second VPN's `0.0.0.0/1 128.0.0.0/1`) are ignored and logged once per guest with "ignoring non-private subnet(s)". If all auto-detected subnets are dropped, the RFC1918 fallback (`10.0.0.0/8 172.16.0.0/12 192.168.0.0/16`) is used instead of allowing the whole internet.
+- `MULLVAD_LAN_SUBNET` extras are validated with `cidr_network` before any guest is touched. Each entry must be a valid IPv4 CIDR with prefix length >= 8. Invalid entries (e.g. `0.0.0.0/0`, `10.0.0.0/33`, `foo/24`) cause the script to exit non-zero with a clear error message and no guest operations are performed.
+- The nftables asset comment and the embedded copy in `bulkvpn-deploy.sh` now correctly state that the LAN line is templated from `resolve_lan_list` (auto-detected subnets, other guests' subnets, and `MULLVAD_LAN_SUBNET` extras), not just from `MULLVAD_LAN_SUBNET`.
+- README: the "LAN access is automatic" paragraph now documents that guest-detected non-private subnets are ignored and that `MULLVAD_LAN_SUBNET` entries must be valid IPv4 CIDRs with prefix /8 or longer.
 
 - Kill-switch `forward` chain: a physical uplink named like a container bridge
   (`br-*`, `docker*`, `podman*`, `cni*`) no longer opens forwarded traffic. The

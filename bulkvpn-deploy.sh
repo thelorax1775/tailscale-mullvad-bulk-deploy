@@ -330,7 +330,8 @@ cat <<'NFT_EOF'
 # Reload idempotently with:  nft -f /etc/nftables.d/mullvad-killswitch.nft
 #
 # Adjust LAN to match your local subnet if it isn't 192.168.1.0/24.
-# (bulkvpn-deploy.sh templates this line from MULLVAD_LAN_SUBNET.)
+# (bulkvpn-deploy.sh templates this line from resolve_lan_list: auto-detected
+# guest subnets, other guests' subnets, and MULLVAD_LAN_SUBNET extras.)
 
 define LAN = 192.168.1.0/24
 
@@ -512,20 +513,47 @@ nft_templated() {   # $1 = LAN value for the nft `define LAN` line (e.g. "{ 192.
 GUEST_LAN_SET=""
 
 # resolve_lan_list: echo a space-separated list of subnets to keep reachable for
-# one guest — the guest's own auto-detected LAN(s), every other running guest's
-# LAN(s) on the node, plus any operator-specified extras, falling back to the
-# RFC1918 private ranges so a guest is never locked out.
+# one guest — the guest's own auto-detected LAN(s) (filtered to private only),
+# every other running guest's LAN(s) on the node (already private from the
+# pre-scan), plus any operator-specified extras (valid CIDR, prefix >= 8),
+# falling back to the RFC1918 private ranges so a guest is never locked out.
 resolve_lan_list() {   # engine id
     local detected="" extras="" guests="" all
     if [[ "$MULLVAD_LAN_AUTODETECT" == "1" ]]; then
         detected="$(run_guest "$1" "$2" "$CMD_DETECT_LAN" 2>/dev/null | tr -d '\r')"
+        # Filter auto-detected subnets through private_cidr_filter; log any dropped.
+        if [[ -n "$detected" ]]; then
+            local kept dropped
+            kept="$(printf '%s\n' "$detected" | tr ' ' '\n' | private_cidr_filter | paste -sd' ' -)"
+            dropped="$(printf '%s\n' "$detected" | tr ' ' '\n' | { grep -vxF -f <(printf '%s\n' "$kept" | tr ' ' '\n') || true; } | paste -sd' ' -)"
+            [[ -n "$dropped" ]] && printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "resolve_lan_list: ${1}/${2} ignoring non-private subnet(s): ${dropped}" >&2
+            detected="$kept"
+        fi
     fi
     [[ "$MULLVAD_LAN_INCLUDE_GUESTS" == "1" ]] && guests="$GUEST_LAN_SET"
-    extras="$(printf '%s' "$MULLVAD_LAN_SUBNET" | tr ',' ' ')"
+    extras="$(validate_lan_extras)" || return 1
     # normalise to one CIDR per line, keep only things that look like subnets, dedupe.
     all="$(printf '%s %s %s\n' "$extras" "$detected" "$guests" | tr ' ' '\n' | grep -E '/[0-9]+$' | sort -u || true)"
     [[ -n "$all" ]] || all=$'10.0.0.0/8\n172.16.0.0/12\n192.168.0.0/16'
     printf '%s' "$(printf '%s\n' "$all" | paste -sd' ' -)"
+}
+
+# validate_lan_extras: validate MULLVAD_LAN_SUBNET entries and print normalized ones.
+# Each must be a valid IPv4 CIDR with prefix >= 8. Exits non-zero on any invalid entry.
+# Uses cidr_network for validation and normalization (host bits cleared).
+# Called from main() and resolve_lan_list().
+validate_lan_extras() {
+    [[ -n "$MULLVAD_LAN_SUBNET" ]] || { echo ""; return 0; }
+    local -a entries
+    local entry norm prefix
+    # Split without globbing: IFS=', ' reads the comma/space separated list safely.
+    IFS=', ' read -ra entries <<<"$MULLVAD_LAN_SUBNET"
+    for entry in "${entries[@]}"; do
+        norm="$(cidr_network "$entry" 2>/dev/null)" || { log "FATAL: MULLVAD_LAN_SUBNET: invalid CIDR '$entry'" >&2; return 1; }
+        prefix="${norm##*/}"
+        (( prefix >= 8 )) || { log "FATAL: MULLVAD_LAN_SUBNET: prefix length must be >= 8, got '$entry' (normalised: $norm)" >&2; return 1; }
+        printf '%s ' "$norm"
+    done
 }
 
 # lan_nft_set: turn a space-separated subnet list into an nft set literal,
@@ -1162,6 +1190,10 @@ main() {
     [[ -n "$TS_AUTHKEY" ]] || log "TS_AUTHKEY not set — fine if every selected guest is already on the tailnet; a guest that needs enrollment will fail"
     log "Log:  $LOG_FILE"
     log "----------------------------------------------------------------------"
+
+    # Validate MULLVAD_LAN_SUBNET early: each entry must be a valid CIDR with prefix >= 8.
+    # Invalid entries stop the script before any guest is touched.
+    validate_lan_extras >/dev/null || return 1
 
     ensure_host_tun
 
