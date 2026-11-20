@@ -181,6 +181,7 @@ By default each guest's own LAN subnet is **auto-detected and kept reachable**, 
 | `MULLVAD_COUNTRY_FILTER` | *(any)* | Restrict exit-node rotation to a country (e.g. `USA`) |
 | `MULLVAD_PREFERRED_NODE` | *(none)* | Exit node to prefer and return to, e.g. `us-bos-wg-001.mullvad.ts.net`. Rotation tries it first; if it fails, it falls back to another node within `MULLVAD_COUNTRY_FILTER`, and every `--check-only` heal moves the guest back once the preferred node works again. A rotation while already on it stays on it. |
 | `PVE_NODE` | `hostname -s` | Proxmox node to scan |
+| `PVE_LXC_CONF_DIR` | `/etc/pve/lxc` | Directory holding the CT configs (`<ctid>.conf`); the tests point it at a temp directory |
 | `SELECT_GUESTS` | *(unset)* | Space/comma-separated vmids to deploy to. Unset + a terminal → an interactive checklist to pick running guests; unset + no terminal (cron/pipe) → every running guest (the historical default). |
 | `DRY_RUN` | `0` | `1` = change nothing; run the same read-only checks as a real run and report `WOULD deploy` / `WOULD enroll` / `WOULD skip` / `WOULD fail` per guest (see [Dry run](#dry-run)) |
 | `FORCE_REDEPLOY` | `0` | `1` = re-push assets and reload the ruleset on **already-protected** guests too (use to roll out config/asset changes to guests deployed by an earlier run) |
@@ -208,7 +209,7 @@ Every run writes a timestamped log to `/root/bulkvpn-<timestamp>.log` and prints
 - **Guests protected by an earlier version need `FORCE_REDEPLOY=1`.** Two leaks in the earlier ruleset are closed only when the new ruleset is pushed: connections opened through the tunnel kept leaving through the physical NIC after the exit node went away, and UDP to port 67 on any internet address was allowed. A plain re-run skips already-protected guests, so run with `FORCE_REDEPLOY=1` to receive the fix.
 - **systemd only.** The kill-switch ships as systemd units; non-systemd guests (Alpine/OpenRC, etc.) are detected and skipped.
 - **VMs need qemu-guest-agent** installed and running, or they're skipped with a note.
-- **The Proxmox host itself is never modified** (beyond loading the `tun` kernel module for LXC passthrough, and appending the `/dev/net/tun` passthrough lines to `/etc/pve/lxc/<ctid>.conf` of a selected CT that has to be enrolled) — only selected guests are touched. The module is loaded and persisted in `/etc/modules-load.d/tun.conf` only when it is neither built into the running kernel (`modules.builtin`) nor already loaded (`/sys/module/tun`); a dry run only reports that it would do so.
+- **The Proxmox host itself is never modified** (beyond loading the `tun` kernel module for LXC passthrough, and adding the two `/dev/net/tun` passthrough lines to the current settings in `/etc/pve/lxc/<ctid>.conf` of a selected CT that has to be enrolled — the lines before the first `[snapshot]` header, never a snapshot section, and only the line that is missing) — only selected guests are touched. The module is loaded and persisted in `/etc/modules-load.d/tun.conf` only when it is neither built into the running kernel (`modules.builtin`) nor already loaded (`/sys/module/tun`); a dry run only reports that it would do so.
 
 ## Repository layout
 

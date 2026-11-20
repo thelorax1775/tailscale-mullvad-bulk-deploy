@@ -28,6 +28,19 @@
 - README: on a `br-*`-named uplink `output`'s `ct direction reply` accepts let
   the guest's replies to inbound connections from outside the LAN set leave the
   uplink; the caveat now says so instead of claiming they are dropped.
+
+- Enrolling a container no longer writes the `/dev/net/tun` passthrough lines
+  into a snapshot. A CT config is the current settings followed by one
+  `[name]` section per snapshot, and the lines were appended to the end of the
+  file, i.e. into the last snapshot: the CT was rebooted without a tun device,
+  the join failed, and every later run (and the dry run) believed tun was
+  configured. `lxc_tun_configured`, `enable_tun_lxc` and `lxc_is_unprivileged`
+  now look only at the lines before the first `[...]` header, and missing lines
+  are inserted at the end of those, before the blank lines that precede the
+  first snapshot. Snapshot sections are left byte-identical. New variable
+  `PVE_LXC_CONF_DIR` (default `/etc/pve/lxc`) names the config directory.
+  If the rewrite fails or yields an unexpected line count, the CT config is left
+  untouched and a WARN line says the tun lines were not written.
 - Watchdog: `mullvad-rotate.sh` now restores the kill-switch when something has
   removed it. Its connectivity probe counts any successful connect as a working
   tunnel, which is only true while the kill-switch is loaded; after
