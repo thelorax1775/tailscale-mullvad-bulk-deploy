@@ -6,3 +6,6 @@ bulkvpn-*.log
 *.swp
 *~
 .DS_Store
+
+# Git worktrees from other tasks
+.worktrees/
