@@ -341,8 +341,9 @@ table inet mullvad_killswitch {
         # set. Direction (not conntrack state) is what keeps this safe: a flow
         # the guest opened through the tunnel is direction "original", so it
         # never matches here, even if it is re-routed onto an uplink whose name
-        # happens to match br-*. (Such an uplink still gets the plain "br-*"
-        # accept in chain forward; see the README caveats.)
+        # happens to match br-*. On such an uplink, though, replies to an
+        # inbound connection from OUTSIDE the LAN set do leave the uplink;
+        # see the README caveats.)
         oifname "docker*" ct direction reply accept
         oifname "br-*" ct direction reply accept
         oifname "podman*" ct direction reply accept
@@ -368,10 +369,31 @@ table inet mullvad_killswitch {
 
         ip daddr $LAN accept
 
-        oifname "docker*" accept
-        oifname "br-*" accept
-        oifname "podman*" accept
-        oifname "cni*" accept
+        # Into a local container bridge, but never on the interface name
+        # alone: a guest whose physical uplink is itself called br-* (netplan /
+        # OpenStack bridged uplinks) would otherwise let forwarded container
+        # traffic leave the real NIC with the tunnel down. Two narrow cases
+        # instead:
+        #  - replies (ct direction reply): answers to a connection that came
+        #    in, e.g. from tailscale0 or the internet to a container;
+        #  - published ports: a connection that was DNATed to a container.
+        # A NEW connection a container opens (original direction, not DNATed)
+        # is judged only by the rules above: out tailscale0 or to the LAN set.
+        oifname "docker*" ct direction reply accept
+        oifname "br-*" ct direction reply accept
+        oifname "podman*" ct direction reply accept
+        oifname "cni*" ct direction reply accept
+        oifname "docker*" ct status dnat accept
+        oifname "br-*" ct status dnat accept
+        oifname "podman*" ct status dnat accept
+        oifname "cni*" ct status dnat accept
+
+        # Container to container (another bridge, or the same bridge when
+        # br_netfilter is loaded): in from a container bridge, out to a
+        # container bridge, to a private address. The destination test is what
+        # keeps a br-* *uplink* from matching: public addresses never pass.
+        iifname { "docker*", "br-*", "podman*", "cni*" } oifname { "docker*", "br-*", "podman*", "cni*" } ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept
+        iifname { "docker*", "br-*", "podman*", "cni*" } oifname { "docker*", "br-*", "podman*", "cni*" } ip6 daddr fc00::/7 accept
     }
 }
 NFT_EOF
