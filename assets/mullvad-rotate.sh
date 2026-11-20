@@ -39,7 +39,19 @@ TAILSCALE="$(command -v tailscale || echo /usr/bin/tailscale)"
 CHECK_ONLY=false
 [[ "${1:-}" == "--check-only" ]] && CHECK_ONLY=true
 
-log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FILE"; }
+# LOG_WARNED tracks whether we've already warned about log file failure (best-effort logging).
+LOG_WARNED=false
+log() {
+    local msg
+    msg="$(date '+%Y-%m-%d %H:%M:%S')  $*"
+    printf '%s\n' "$msg"
+    # Best-effort append to log file; on failure, warn once and continue.
+    # Wrap in { ... } 2>/dev/null so bash's own redirect error is suppressed.
+    if ! $LOG_WARNED && ! { printf '%s\n' "$msg" >> "$LOG_FILE"; } 2>/dev/null; then
+        LOG_WARNED=true
+        printf 'WARN: cannot write to log file %s — continuing with stdout only\n' "$LOG_FILE" >&2
+    fi
+}
 die() { log "ERROR: $*"; exit 1; }
 
 # ensure_killswitch: the probe in verify_connectivity is only proof of a working
