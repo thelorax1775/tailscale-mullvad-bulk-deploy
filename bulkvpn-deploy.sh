@@ -499,8 +499,9 @@ HT_EOF
 
 # Templated variants (apply per-deployment config).
 # Uses bash to shell-quote values with printf '%q', then substitutes them
-# into the template using awk (no regex/replacement metacharacters involved),
-# so special characters (&, |, ", $, etc.) are written literally and safely.
+# into the template using awk with ENVIRON (no regex/replacement metacharacters
+# involved), so special characters (&, |, ", $, etc.) are written literally and
+# safely. ENVIRON is used instead of -v because -v processes backslash escapes.
 rotate_templated() {   # $1 = space-separated LAN subnets to keep off the tunnel
     local lan_subnets="$1"
     # Pre-quote all values using bash printf '%q' (safe for eval)
@@ -508,17 +509,19 @@ rotate_templated() {   # $1 = space-separated LAN subnets to keep off the tunnel
     cf=$(printf %q "${MULLVAD_COUNTRY_FILTER}")
     pn=$(printf %q "${MULLVAD_PREFERRED_NODE}")
     ls=$(printf %q "${lan_subnets}")
-    asset_rotate | awk -v cf="${cf}" -v pn="${pn}" -v ls="${ls}" '
+    # Export for awk ENVIRON access
+    export cf pn ls
+    asset_rotate | awk '
         /^COUNTRY_FILTER=/ {
-            print "COUNTRY_FILTER=" cf
+            print "COUNTRY_FILTER=" ENVIRON["cf"]
             next
         }
         /^PREFERRED_NODE=/ {
-            print "PREFERRED_NODE=" pn
+            print "PREFERRED_NODE=" ENVIRON["pn"]
             next
         }
         /^LAN_SUBNETS=/ {
-            print "LAN_SUBNETS=" ls
+            print "LAN_SUBNETS=" ENVIRON["ls"]
             next
         }
         { print }
@@ -526,9 +529,10 @@ rotate_templated() {   # $1 = space-separated LAN subnets to keep off the tunnel
 }
 nft_templated() {   # $1 = LAN value for the nft `define LAN` line (e.g. "{ 192.168.1.0/24 }")
     local lan_value="$1"
-    asset_nft | awk -v lv="${lan_value}" '
+    export lan_value
+    asset_nft | awk '
         /^define LAN = / {
-            print "define LAN = " lv
+            print "define LAN = " ENVIRON["lan_value"]
             next
         }
         { print }
