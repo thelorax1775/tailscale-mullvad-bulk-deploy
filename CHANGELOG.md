@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Documentation
+- README: added a "DNS lookups do not go through the tunnel" note in "How the kill-switch behaves once deployed" explaining that the tool does not change the guest's DNS resolver, lookups to a LAN resolver are allowed directly and are not routed through the exit node, and to send DNS through the tunnel the guest must use a resolver outside the LAN set.
+
 ### Fixed
 - The watchdog (`assets/mullvad-rotate.sh` and the embedded copy in `bulkvpn-deploy.sh`) keeps healing the Mullvad exit node tunnel even when its log file cannot be written (e.g., full disk, missing directory, read-only filesystem). The `log()` function now prints to stdout and appends to the log file on a best-effort basis: a failed append does not make `log()` or `die()` return non-zero, and at most one warning per run is printed to stderr. Previously, `tee -a "$LOG_FILE"` under `set -euo pipefail` caused the whole script to exit at the first log line, leaving the guest with a blocked tunnel and no self-healing.
 - `MULLVAD_COUNTRY_FILTER` and `MULLVAD_PREFERRED_NODE` values containing shell metacharacters (`&`, `|`, `"`, `$`, backslash, etc.) are now written literally into the watchdog script without breaking the render or enabling code injection. The fix uses `printf '%q'` quoting in the templating functions and renders the output into variables in `deploy_killswitch`; a failed or empty render logs a `FAILED` line and returns non-zero before any `push_file` call, so an empty file never overwrites a working watchdog.
