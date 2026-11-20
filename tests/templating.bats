@@ -25,7 +25,8 @@ SPECIAL_VALUES=(
 # Helper: render rotate_templated with given env vars and capture output
 render_rotate() {
     local country="$1" node="$2" lan="$3"
-    MULLVAD_COUNTRY_FILTER="$country" MULLVAD_PREFERRED_NODE="$node" \
+    export MULLVAD_COUNTRY_FILTER="$country"
+    export MULLVAD_PREFERRED_NODE="$node"
     lib rotate_templated "$lan"
 }
 
