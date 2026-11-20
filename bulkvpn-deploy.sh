@@ -336,15 +336,17 @@ table inet mullvad_killswitch {
         ip daddr $LAN accept
 
         # The guest's replies to containers on a local bridge (DNS, a service on
-        # the guest). Only packets of connections the container opened: a NEW
-        # connection from the guest into a bridge is not allowed unless that subnet
-        # is in the LAN set. Being limited to established flows also means a
-        # physical uplink that happens to be called br-* is not opened up: a
-        # re-routed flow changes oifname and no longer matches.
-        oifname "docker*" ct state established,related accept
-        oifname "br-*" ct state established,related accept
-        oifname "podman*" ct state established,related accept
-        oifname "cni*" ct state established,related accept
+        # the guest). Only reply-direction packets: a NEW connection from the
+        # guest into a bridge is not allowed unless that subnet is in the LAN
+        # set. Direction (not conntrack state) is what keeps this safe: a flow
+        # the guest opened through the tunnel is direction "original", so it
+        # never matches here, even if it is re-routed onto an uplink whose name
+        # happens to match br-*. (Such an uplink still gets the plain "br-*"
+        # accept in chain forward; see the README caveats.)
+        oifname "docker*" ct direction reply accept
+        oifname "br-*" ct direction reply accept
+        oifname "podman*" ct direction reply accept
+        oifname "cni*" ct direction reply accept
 
         # DHCP client (harmless if you use a static IP): only the client
         # port 68 -> server port 67, only to the IPv4 broadcast address.

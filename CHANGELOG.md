@@ -27,8 +27,11 @@
   physical side before the fix, 0 after) and with the audit script case 2.
   Already-protected guests need `FORCE_REDEPLOY=1` to receive the fix.
 - Kill-switch `output` chain now accepts packets for local container bridges
-  (`docker*`, `br-*`, `podman*`, `cni*`), so a guest's own replies to a
-  container keep working without the established/related rule.
+  (`docker*`, `br-*`, `podman*`, `cni*`), reply direction only (`ct direction
+  reply`), so a guest's own replies to a container keep working without the
+  established/related rule. Known limitation: on a guest whose physical uplink
+  is named like one of these, the `forward` chain's plain accept still applies
+  (see README).
 
 ### Added
 

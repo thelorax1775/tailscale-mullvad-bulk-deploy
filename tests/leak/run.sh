@@ -49,12 +49,13 @@ if [[ "${BULKVPN_LEAK_IN_NS:-}" != "1" ]]; then
     elif unshare --user --map-root-user "${ns_flags[@]}" true 2>/dev/null; then
         exec env BULKVPN_LEAK_IN_NS=1 unshare --user --map-root-user "${ns_flags[@]}" bash "$SELF"
     elif [[ "$(id -u)" != "0" ]] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-        exec sudo -n env "PATH=$PATH" "CI=${CI:-}" bash "$SELF"
+        exec sudo -n env "PATH=$PATH" "CI=${CI:-}" "BULKVPN_LEAK_PHYS=${BULKVPN_LEAK_PHYS:-eth0}" bash "$SELF"
     fi
     cannot_run "could not create network namespaces (need root, passwordless sudo, or unprivileged user namespaces)"
 fi
 
 ### ---- everything below runs inside the private namespaces -------------------
+PHYS="${BULKVPN_LEAK_PHYS:-eth0}"   # the guest's physical NIC; check.sh also runs the rig with BULKVPN_LEAK_PHYS=br-up
 broken() { echo "leak rig: BROKEN - $1" >&2; exit 1; }
 
 # A private /run: `ip netns` keeps its handles in /run/netns, and the rig uses
@@ -64,7 +65,7 @@ mkdir -p /run/netns /run/rig
 
 ip netns add G || broken "cannot create the guest namespace"
 ip link set lo up
-ip link add weth type veth peer name eth0 netns G || broken "cannot create the veth pair for eth0"
+ip link add weth type veth peer name "$PHYS" netns G || broken "cannot create the veth pair for $PHYS"
 ip link add wts type veth peer name tailscale0 netns G || broken "cannot create the veth pair for tailscale0"
 ip link add inet0 type dummy || broken "cannot create the dummy internet interface"
 ip addr add 192.168.50.1/24 dev weth
@@ -81,9 +82,9 @@ sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.weth.rp_filter=0 \
 
 g() { ip netns exec G "$@"; }
 g ip link set lo up
-g ip addr add 192.168.50.2/24 dev eth0
-g ip link set eth0 up
-g ip -6 addr add fd50::2/64 dev eth0 nodad
+g ip addr add 192.168.50.2/24 dev "$PHYS"
+g ip link set "$PHYS" up
+g ip -6 addr add fd50::2/64 dev "$PHYS" nodad
 g ip route add default via 192.168.50.1
 g ip -6 route add default via fd50::1
 g ip addr add 100.64.0.2/32 dev tailscale0
@@ -101,7 +102,7 @@ c ip link set lo up
 c ip addr add 172.17.0.2/24 dev cveth
 c ip link set cveth up
 c ip route add default via 172.17.0.1
-g sysctl -qw net.ipv4.ip_forward=1 net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.docker0.rp_filter=0 net.ipv4.conf.tailscale0.rp_filter=0 net.ipv4.conf.eth0.rp_filter=0 2>/dev/null
+g sysctl -qw net.ipv4.ip_forward=1 net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.docker0.rp_filter=0 net.ipv4.conf.tailscale0.rp_filter=0 net.ipv4.conf."$PHYS".rp_filter=0 2>/dev/null
 # What selecting / clearing an exit node does to the guest's routing.
 # Table 52 sits ahead of the main table, so (like the LAN bypass routes the
 # rotate script adds) the container bridge needs a route of its own in it.
@@ -263,7 +264,7 @@ fi
 # A client keeps writing to a socket that was opened through the tunnel while
 # the harness removes the table-52 default route (what clearing the exit node
 # does). An "established" accept ahead of the interface check lets the
-# re-routed packets out of eth0.
+# re-routed packets out of the physical NIC.
 LONG_CLIENT='import socket, sys, time
 s = socket.socket()
 s.settimeout(3)
@@ -276,6 +277,17 @@ while time.time() < end:
     except OSError:
         pass
     time.sleep(0.1)'
+# Known limitation, documented in the README: chain forward has a plain
+# `oifname "br-*" accept`, so on a guest whose physical uplink is itself named
+# br-* forwarded flows are not protected. The forwarded cases are therefore
+# skipped in the br-up run instead of asserting something that is not true.
+forwarded_case() {   # name  prefix
+    if [[ "$PHYS" == br-* ]]; then
+        echo "SKIP  $1 (known limitation: forward accepts oifname br-*)"
+    else
+        flow_case "$@"
+    fi
+}
 flow_case() {   # name  "command prefix that runs the client"
     local name="$1"; shift
     tunnel_up; reset
@@ -303,7 +315,7 @@ table ip nat {
 EOF2
 # With `masquerade` the kernel itself drops a flow whose output interface
 # changed, so this case passes even without the fix; it documents that.
-flow_case "tunnel route removed: an established forwarded (masqueraded) connection from a container does not move to the physical NIC" c
+forwarded_case "tunnel route removed: an established forwarded (masqueraded) connection from a container does not move to the physical NIC" c
 # A fixed `snat to` (static NAT, or a firewall that does not use masquerade)
 # has no such guard: the re-routed packets keep the Tailscale source address
 # and only the kill-switch stops them.
@@ -315,7 +327,7 @@ table ip nat {
     }
 }
 EOF2
-flow_case "tunnel route removed: an established forwarded (SNATed to the tailscale address) connection from a container does not move to the physical NIC" c
+forwarded_case "tunnel route removed: an established forwarded (SNATed to the tailscale address) connection from a container does not move to the physical NIC" c
 
 udp_send() {   # ns-prefix  family(4|6)  dst  sport  mark(0=none)  bind-device("" = none)  dport
     "$1" python3 -c 'import socket, sys
@@ -358,21 +370,21 @@ fi
 
 ### ---- things that must keep working ----------------------------------------
 tunnel_down; reset
-udp_send g 4 255.255.255.255 68 0 eth0 67; sleep 0.3
+udp_send g 4 255.255.255.255 68 0 "$PHYS" 67; sleep 0.3
 n="$(count phys_dhcp)"
 if [[ "$n" -gt 0 ]]; then
-    result ok "tunnel down: DHCP-shaped datagram (68 -> 255.255.255.255:67) leaves eth0" "$n packets on the physical side"
+    result ok "tunnel down: DHCP-shaped datagram (68 -> 255.255.255.255:67) leaves $PHYS" "$n packets on the physical side"
 else
-    result bad "tunnel down: DHCP-shaped datagram (68 -> 255.255.255.255:67) leaves eth0" "0 packets arrived; DHCP would break"
+    result bad "tunnel down: DHCP-shaped datagram (68 -> 255.255.255.255:67) leaves $PHYS" "0 packets arrived; DHCP would break"
 fi
 
 reset
 udp_send g 4 203.0.113.10 40000 0x80000 "" 9999; sleep 0.3
 n="$(count phys_inet)"
 if [[ "$n" -gt 0 ]]; then
-    result ok "tunnel down: packet with Tailscale's bypass mark 0x80000 to an internet address leaves eth0" "$n packets on the physical side"
+    result ok "tunnel down: packet with Tailscale's bypass mark 0x80000 to an internet address leaves $PHYS" "$n packets on the physical side"
 else
-    result bad "tunnel down: packet with Tailscale's bypass mark 0x80000 to an internet address leaves eth0" "0 packets arrived; tailscaled could not reach its peers"
+    result bad "tunnel down: packet with Tailscale's bypass mark 0x80000 to an internet address leaves $PHYS" "0 packets arrived; tailscaled could not reach its peers"
 fi
 reset
 udp_send g 4 203.0.113.10 40001 0 "" 9999; sleep 0.3
