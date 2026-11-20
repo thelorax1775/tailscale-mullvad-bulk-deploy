@@ -1,12 +1,16 @@
 [Unit]
 Description=Mullvad/Tailscale fail-closed kill-switch (nftables)
 Wants=network-pre.target
+After=nftables.service
+PartOf=nftables.service
+ReloadPropagatedFrom=nftables.service
 Before=network-pre.target tailscaled.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f /etc/nftables.d/mullvad-killswitch.nft
+ExecReload=/usr/sbin/nft -f /etc/nftables.d/mullvad-killswitch.nft
 
 [Install]
 WantedBy=multi-user.target

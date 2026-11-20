@@ -61,3 +61,29 @@ nft_check_lan() {   # SPACE-SEPARATED SUBNETS
     run grep -nE '^[[:space:]]*(ct state established|udp dport 67 accept)' "$REPO/assets/nftables/mullvad-killswitch.nft"
     [ "$status" -eq 1 ]
 }
+
+# ---- the kill-switch unit follows nftables.service ---------------------------
+# Text only: the unit has NOT been exercised on a running systemd by these tests.
+@test "mullvad-killswitch.service is reapplied when nftables.service restarts or reloads" {
+    f="$REPO/assets/systemd/mullvad-killswitch.service"
+    grep -qx 'After=nftables.service' "$f"
+    grep -qx 'PartOf=nftables.service' "$f"
+    grep -qx 'ReloadPropagatedFrom=nftables.service' "$f"
+    grep -qx 'ExecReload=/usr/sbin/nft -f /etc/nftables.d/mullvad-killswitch.nft' "$f"
+    grep -qx 'Before=network-pre.target tailscaled.service' "$f"
+    grep -qx 'RemainAfterExit=yes' "$f"
+    grep -qx 'ExecStart=/usr/sbin/nft -f /etc/nftables.d/mullvad-killswitch.nft' "$f"
+}
+
+@test "CMD_PROTECTED checks the kill-switch table as well as script, service and timer" {
+    # shellcheck disable=SC2016  # expanded by the inner shell
+    run libsh 'printf %s "$CMD_PROTECTED"'
+    [[ "$output" == *"nft list table inet mullvad_killswitch"* ]]
+    [[ "$output" == *"mullvad-healthcheck.timer"* ]]
+}
+
+@test "CMD_VERIFY still checks the kill-switch table" {
+    # shellcheck disable=SC2016  # expanded by the inner shell
+    run libsh 'printf %s "$CMD_VERIFY"'
+    [[ "$output" == *"nft list table inet mullvad_killswitch"* ]]
+}

@@ -7,6 +7,8 @@
 #   lxc.json / qemu.json     what `pvesh get /nodes/N/lxc|qemu` returns
 #   ct<ID>.* / vm<ID>.*      per-guest behaviour (guest = ct101, vm301, ...):
 #     .protected   the kill-switch is already installed
+#     .notable     with .protected: script, service and timer are there but
+#                  `nft list table inet mullvad_killswitch` fails
 #     .nosystemd   the guest is not systemd-based
 #     .probe       output of the Tailscale probe command
 #     .mullvad     a Mullvad exit node is visible on the tailnet
@@ -23,7 +25,10 @@ printf '%s %s\n' "$name" "$*" >> "${STUB_LOG:?STUB_LOG is not set}"
 guest_cmd() {
     local g="$1$2" cmd="$3"
     case "$cmd" in
-        "test -x /usr/local/bin/mullvad-rotate.sh && systemctl is-enabled"*) [[ -e "$S/$g.protected" ]]; return ;;
+        "test -x /usr/local/bin/mullvad-rotate.sh && systemctl is-enabled"*) [[ -e "$S/$g.protected" ]] || return 1
+            # .notable: the table is gone, so only a command that asks for it notices
+            if [[ -e "$S/$g.notable" && "$cmd" == *"nft list table inet mullvad_killswitch"* ]]; then return 1; fi
+            return 0 ;;
         "test -d /run/systemd/system") [[ ! -e "$S/$g.nosystemd" ]]; return ;;
         "b=0; command -v tailscale"*) cat "$S/$g.probe" 2>/dev/null; return 0 ;;
         "tailscale exit-node list"*) [[ -e "$S/$g.mullvad" ]]; return ;;

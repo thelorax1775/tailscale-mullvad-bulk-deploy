@@ -4,6 +4,19 @@
 
 ### Fixed
 
+- Watchdog: `mullvad-rotate.sh` now restores the kill-switch when something has
+  removed it. Its connectivity probe counts any successful connect as a working
+  tunnel, which is only true while the kill-switch is loaded; after
+  `nft flush ruleset` with the tunnel down it logged "tunnel healthy" while its
+  own probes left through the physical NIC. Every run now checks
+  `nft list table inet mullvad_killswitch` first, reloads
+  `/etc/nftables.d/mullvad-killswitch.nft` if it is missing (logged), and exits
+  non-zero without probing if it cannot. `mullvad-killswitch.service` gains
+  `After=`, `PartOf=`, `ReloadPropagatedFrom=nftables.service` and an
+  `ExecReload=`, so restarting or upgrading nftables re-applies it immediately
+  (not exercised on a running systemd). `bulkvpn-deploy.sh` no longer counts a
+  guest as already protected when the table is not loaded. Already-protected
+  guests need `FORCE_REDEPLOY=1` to receive the new script and unit.
 - Kill-switch: connections opened through the tunnel no longer leave through the
   physical NIC after the exit node is cleared. `ct state established,related
   accept` sat before any interface check in both chains; when Tailscale removed
