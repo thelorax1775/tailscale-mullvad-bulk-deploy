@@ -42,16 +42,24 @@ render_nft() {
     run render_rotate "$v" "$v" "$lan_subnets"
     [ "$status" -eq 0 ]
     local rendered="$output"
+    
+    # Debug: show what was rendered
+    printf 'DEBUG rendered:\n%s\n' "$rendered" | grep -E '^(COUNTRY_FILTER|PREFERRED_NODE|LAN_SUBNETS)=' >&2
 
     # Extract just the COUNTRY_FILTER= and PREFERRED_NODE= lines
     local cf_line pn_line
     cf_line=$(printf '%s\n' "$rendered" | grep '^COUNTRY_FILTER=')
     pn_line=$(printf '%s\n' "$rendered" | grep '^PREFERRED_NODE=')
+    
+    printf 'DEBUG cf_line: [%s]\n' "$cf_line" >&2
+    printf 'DEBUG pn_line: [%s]\n' "$pn_line" >&2
 
     # Run in a fresh bash using eval to properly interpret shell-quoted values
     # (the lines are already shell-quoted with printf %q)
     run bash -c 'eval "$1"; eval "$2"; printf "COUNTRY_FILTER=%s\n" "$COUNTRY_FILTER"; printf "PREFERRED_NODE=%s\n" "$PREFERRED_NODE"' _ "$cf_line" "$pn_line"
     [ "$status" -eq 0 ]
+    printf 'DEBUG lines[0]: [%s]\n' "${lines[0]}" >&2
+    printf 'DEBUG lines[1]: [%s]\n' "${lines[1]}" >&2
     # Both should print exactly V
     [[ "${lines[0]}" == "COUNTRY_FILTER=$v" ]]
     [[ "${lines[1]}" == "PREFERRED_NODE=$v" ]]
