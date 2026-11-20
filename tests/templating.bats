@@ -248,3 +248,41 @@ render_nft() {
     [[ "$calls" != *"base64 -d > '/usr/local/bin/mullvad-rotate.sh'"* ]]
     [[ "$calls" != *"base64 -d > '/etc/nftables.d/mullvad-killswitch.nft'"* ]]
 }
+
+@test "deploy_killswitch: pushed rotate payload matches rotate_templated output byte for byte including trailing newline" {
+    stub_setup
+    fixture_lxc '[{"vmid":101,"status":"running","name":"ct101"}]'
+    # Set special character values to test literal preservation
+    export MULLVAD_COUNTRY_FILTER="Bosnia & Herzegovina"
+    export MULLVAD_PREFERRED_NODE="a|b"
+    export MULLVAD_LAN_AUTODETECT=0
+    export MULLVAD_LAN_INCLUDE_GUESTS=0
+    export MULLVAD_LAN_SUBNET="192.168.10.0/24"
+    
+    # Get the expected rendered output
+    local expected_rotate
+    expected_rotate="$(
+        # shellcheck source=/dev/null
+        BULKVPN_LIB_ONLY=1 source "$SCRIPT"
+        rotate_templated "192.168.10.0/24"
+    )"
+    
+    run bash -c '
+        BULKVPN_LIB_ONLY=1 source "$0"
+        deploy_killswitch lxc 101 "ct/101 (ct101)"
+    ' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    
+    # Get the actual pushed payload from the stub log
+    local calls
+    calls=$(calls_log)
+    # Extract the base64 payload for mullvad-rotate.sh
+    local b64_payload
+    b64_payload=$(printf '%s\n' "$calls" | grep "base64 -d > '/usr/local/bin/mullvad-rotate.sh'" | sed "s/.*printf '%s' '\([^']*\)'.*/\1/")
+    [ -n "$b64_payload" ]
+    local actual_payload
+    actual_payload=$(printf '%s' "$b64_payload" | base64 -d)
+    
+    # Compare byte for byte
+    [ "$actual_payload" = "$expected_rotate" ]
+}
