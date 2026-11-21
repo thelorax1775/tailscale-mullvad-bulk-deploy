@@ -177,7 +177,7 @@ By default each guest's own LAN subnet is **auto-detected and kept reachable**, 
 | `MULLVAD_LAN_INCLUDE_GUESTS` | `1` | Also allow every other running guest's LAN subnet(s) on the node, so containers, VMs, and LXCs stay reachable to each other on the LAN. Derived from host-side config without entering any guest; private (RFC1918) subnets only. `0` = each guest's own subnet only. |
 | `MULLVAD_LAN_SCAN_EXCLUDE` | *(none)* | Space/comma-separated vmids to leave out of the cross-guest LAN pre-scan (e.g. a router VM) |
 | `MULLVAD_LAN_AGENT_QUERY` | `1` | `1` = in the pre-scan, also ask the QEMU guest agent of **selected** VMs for their addresses (read-only `network-get-interfaces`). `0` = host-side config only. Unselected VMs are never queried either way. |
-| `MULLVAD_LAN_SUBNET` | *(none)* | Extra subnet(s) to always allow, on top of auto-detect (space/comma separated) |
+| `MULLVAD_LAN_SUBNET` | *(none)* | Extra subnet(s) to always allow, on top of auto-detect (space/comma separated; empty entries are ignored) |
 | `MULLVAD_COUNTRY_FILTER` | *(any)* | Restrict exit-node rotation to a country (e.g. `USA`). Values are written literally into the watchdog script; special characters (`&`, `\|`, `"`, `$`, etc.) are preserved exactly. |
 | `MULLVAD_PREFERRED_NODE` | *(none)* | Exit node to prefer and return to, e.g. `us-bos-wg-001.mullvad.ts.net`. Rotation tries it first; if it fails, it falls back to another node within `MULLVAD_COUNTRY_FILTER`, and every `--check-only` heal moves the guest back once the preferred node works again. A rotation while already on it stays on it. Values are written literally into the watchdog script; special characters (`&`, `\|`, `"`, `$`, etc.) are preserved exactly. |
 | `PVE_NODE` | `hostname -s` | Proxmox node to scan |
