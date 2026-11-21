@@ -148,6 +148,69 @@ stray_files() {
     [[ "$output" == *"WOULD_DEPLOY=1"* ]]
 }
 
+@test "MULLVAD_PREFERRED_NODE short name stops script before any guest ops (e2e)" {
+    fixture_lxc '[{"vmid":101,"status":"running","name":"web"}]'
+    fixture_qemu '[]'
+    fixture_flag ct101.mullvad
+    fixture_probe ct101 'bin=1 state=1 profile=1 svc=active backend=Running'
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_PREFERRED_NODE="us-bos-wg-001" DRY_RUN=1 run_main
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"MULLVAD_PREFERRED_NODE"* ]]
+    [[ "$output" == *"us-bos-wg-001"* ]]
+    run calls_log
+    [[ "$output" != *"pct exec"* ]]
+    [[ "$output" != *"qm guest exec"* ]]
+}
+
+@test "MULLVAD_PREFERRED_NODE with trailing dot stops script before any guest ops (e2e)" {
+    fixture_lxc '[{"vmid":101,"status":"running","name":"web"}]'
+    fixture_qemu '[]'
+    fixture_flag ct101.mullvad
+    fixture_probe ct101 'bin=1 state=1 profile=1 svc=active backend=Running'
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_PREFERRED_NODE="us-bos-wg-001.mullvad.ts.net." DRY_RUN=1 run_main
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"MULLVAD_PREFERRED_NODE"* ]]
+    [[ "$output" == *"us-bos-wg-001.mullvad.ts.net."* ]]
+    run calls_log
+    [[ "$output" != *"pct exec"* ]]
+    [[ "$output" != *"qm guest exec"* ]]
+}
+
+@test "MULLVAD_PREFERRED_NODE with shell metacharacters stops script before any guest ops (e2e)" {
+    fixture_lxc '[{"vmid":101,"status":"running","name":"web"}]'
+    fixture_qemu '[]'
+    fixture_flag ct101.mullvad
+    fixture_probe ct101 'bin=1 state=1 profile=1 svc=active backend=Running'
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_PREFERRED_NODE="a|b" DRY_RUN=1 run_main
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"MULLVAD_PREFERRED_NODE"* ]]
+    [[ "$output" == *"a|b"* ]]
+    run calls_log
+    [[ "$output" != *"pct exec"* ]]
+    [[ "$output" != *"qm guest exec"* ]]
+}
+
+@test "MULLVAD_PREFERRED_NODE full Mullvad node name is accepted (e2e)" {
+    fixture_lxc '[{"vmid":101,"status":"running","name":"web"}]'
+    fixture_qemu '[]'
+    fixture_flag ct101.mullvad
+    fixture_probe ct101 'bin=1 state=1 profile=1 svc=active backend=Running'
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_PREFERRED_NODE="us-bos-wg-001.mullvad.ts.net" DRY_RUN=1 run_main
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"WOULD deploy"* ]]
+}
+
+@test "MULLVAD_PREFERRED_NODE unset is accepted (e2e)" {
+    fixture_lxc '[{"vmid":101,"status":"running","name":"web"}]'
+    fixture_qemu '[]'
+    fixture_flag ct101.mullvad
+    fixture_probe ct101 'bin=1 state=1 profile=1 svc=active backend=Running'
+    unset MULLVAD_PREFERRED_NODE
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 DRY_RUN=1 run_main
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"WOULD deploy"* ]]
+}
+
 @test "MULLVAD_LAN_SUBNET invalid /0 stops script before any guest ops (e2e)" {
     fixture_lxc '[{"vmid":101,"status":"running","name":"web"}]'
     fixture_qemu '[]'
