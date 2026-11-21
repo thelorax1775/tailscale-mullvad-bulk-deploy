@@ -592,6 +592,7 @@ validate_lan_extras() {
     # Split without globbing: IFS=', ' reads the comma/space separated list safely.
     IFS=', ' read -ra entries <<<"$MULLVAD_LAN_SUBNET"
     for entry in "${entries[@]}"; do
+        [[ -n "$entry" ]] || continue
         norm="$(cidr_network "$entry" 2>/dev/null)" || { log "FATAL: MULLVAD_LAN_SUBNET: invalid CIDR '$entry'" >&2; return 1; }
         prefix="${norm##*/}"
         (( prefix >= 8 )) || { log "FATAL: MULLVAD_LAN_SUBNET: prefix length must be >= 8, got '$entry' (normalised: $norm)" >&2; return 1; }

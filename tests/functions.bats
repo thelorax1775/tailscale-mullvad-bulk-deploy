@@ -200,6 +200,34 @@ IN
     [[ "$output" == *"1*2.168.1.0/24"* ]]
 }
 
+@test "validate_lan_extras: leading and doubled commas are ignored" {
+    stub_setup
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET=",10.0.0.0/8,,192.168.1.0/24" run libsh '
+        validate_lan_extras
+    '
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"10.0.0.0/8 192.168.1.0/24"* ]]
+    [[ "$output" != *"invalid CIDR"* ]]
+}
+
+@test "resolve_lan_list: stray commas in MULLVAD_LAN_SUBNET still give the listed subnets" {
+    stub_setup
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET=",10.0.0.0/8,,192.168.1.0/24" run libsh '
+        resolve_lan_list lxc 101
+    '
+    [ "$status" -eq 0 ]
+    [ "$output" = "10.0.0.0/8 192.168.1.0/24" ]
+}
+
+@test "validate_lan_extras: an invalid entry next to a stray comma is still rejected" {
+    stub_setup
+    MULLVAD_LAN_AUTODETECT=0 MULLVAD_LAN_INCLUDE_GUESTS=0 MULLVAD_LAN_SUBNET=",foo/24" run libsh '
+        validate_lan_extras
+    '
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"foo/24"* ]]
+}
+
 # ---- lan_nft_set -------------------------------------------------------------
 
 @test "lan_nft_set: several subnets become an nft set literal" {
