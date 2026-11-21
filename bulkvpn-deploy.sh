@@ -86,7 +86,7 @@ Configuration (environment variables):
                            read-only); 0 = host-side config only
   MULLVAD_LAN_SUBNET       extra subnet(s) to always allow (space/comma sep); default: none
   MULLVAD_COUNTRY_FILTER   limit rotation to a country (e.g. "USA"); default: any
-  MULLVAD_PREFERRED_NODE   exit node to prefer and return to, e.g.
+  MULLVAD_PREFERRED_NODE   full node name to prefer and return to, e.g.
                            us-bos-wg-001.mullvad.ts.net; on failure rotation falls
                            back within MULLVAD_COUNTRY_FILTER, and each --check-only
                            run moves back once it works again; default: none
@@ -598,6 +598,16 @@ validate_lan_extras() {
         (( prefix >= 8 )) || { log "FATAL: MULLVAD_LAN_SUBNET: prefix length must be >= 8, got '$entry' (normalised: $norm)" >&2; return 1; }
         printf '%s ' "$norm"
     done
+}
+
+# validate_preferred_node: require the full Mullvad exit node DNS name.
+# An empty value keeps the existing behaviour (no preferred node).
+validate_preferred_node() {
+    [[ -n "$MULLVAD_PREFERRED_NODE" ]] || return 0
+    [[ "$MULLVAD_PREFERRED_NODE" =~ ^[a-z0-9][a-z0-9-]*\.mullvad\.ts\.net$ ]] || {
+        log "FATAL: MULLVAD_PREFERRED_NODE must be a full Mullvad exit node name like us-bos-wg-001.mullvad.ts.net (as shown by tailscale exit-node list), got '$MULLVAD_PREFERRED_NODE'" >&2
+        return 1
+    }
 }
 
 # lan_nft_set: turn a space-separated subnet list into an nft set literal,
@@ -1248,6 +1258,10 @@ main() {
     # Validate MULLVAD_LAN_SUBNET early: each entry must be a valid CIDR with prefix >= 8.
     # Invalid entries stop the script before any guest is touched.
     validate_lan_extras >/dev/null || return 1
+
+    # Validate MULLVAD_PREFERRED_NODE early: when set, it must be a full Mullvad
+    # exit node DNS name. Invalid entries stop the script before any guest is touched.
+    validate_preferred_node || return 1
 
     ensure_host_tun
 
