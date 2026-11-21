@@ -74,7 +74,8 @@ EOF
 
     # Must not contain
     [[ "$output" != *"ct/103"* ]]
-    [[ "$output" != *"203.0.113"* ]] || [[ "$output" == *"SET=[10.20.0.0/24 10.5.0.0/16 192.168.10.0/24 ]"* ]] # 203.0.113 must not be in SET
+    set_line="$(grep '^SET=' <<<"$output")"
+    [[ "$set_line" != *"203.0.113"* ]] # 203.0.113 must not be in SET
     [[ "$output" != *"10.99"* ]]
 
     # Stub call log verification
@@ -155,16 +156,22 @@ EOF
     fixture_lxc '[]'
     fixture_qemu '[{"vmid":301,"status":"running","name":"vm"}]'
 
-    # Need to define is_selected to return true for 301
+    # Track qm calls to assert the agent branch runs
+    QM_CALL_LOG="$BATS_TEST_TMPDIR/qm_calls.log"
+    : > "$QM_CALL_LOG"
+
     # shellcheck disable=SC2016  # single quotes intentional: snippet is expanded by the inner bash
-    MULLVAD_LAN_INCLUDE_GUESTS=1 MULLVAD_LAN_AGENT_QUERY=1 SELECT_GUESTS=301 run --separate-stderr bash -c '
+    MULLVAD_LAN_INCLUDE_GUESTS=1 MULLVAD_LAN_AGENT_QUERY=1 run --separate-stderr bash -c '
         BULKVPN_LIB_ONLY=1 source "$0"
+        # Define is_selected so the agent branch runs for VM 301
+        is_selected() { [[ "$1" == "301" ]]; }
         # Override qm so guest cmd ping succeeds but network-get-interfaces fails
         qm() {
+            echo "$*" >> '"$QM_CALL_LOG"'
             case "$*" in
                 "guest cmd 301 ping") return 0 ;;
                 "guest cmd 301 network-get-interfaces") echo "agent error" >&2; return 255 ;;
-                "config 301") cat "$STUB_DIR/vm301.config" ;;
+                "config 301") cat '"$STUB_DIR/vm301.config"' ;;
                 *) true ;;
             esac
         }
@@ -175,4 +182,9 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == *"Pre-scan: vm/301 (vm) -> 10.5.0.0/16"* ]]
     [[ "$output" == *"SET=[10.5.0.0/16 ]"* ]]
+
+    # Assert the agent branch ran: qm was called with both ping and network-get-interfaces
+    run cat "$QM_CALL_LOG"
+    [[ "$output" == *"guest cmd 301 ping"* ]]
+    [[ "$output" == *"guest cmd 301 network-get-interfaces"* ]]
 }
