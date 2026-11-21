@@ -411,11 +411,12 @@ s.sendall(b"ping")
 s.settimeout(3)
 print(s.recv(100).decode())'
 inbound_case() {   # name  server-ip  client-source-ip
-    g python3 -c "$INBOUND_SERVER" "$2" &
+    ip netns exec G python3 -c "$INBOUND_SERVER" "$2" &
     local sp=$!
     sleep 0.5
     local out; out="$(timeout 6 python3 -c "$INBOUND_CLIENT" "$3" "$2" 2>&1)"
     wait "$sp" 2>/dev/null
+    [[ -z "$(ip netns exec G ss -Hltn 'sport = :7000')" ]] || broken "leftover test server on port 7000 in G"
     [[ "$out" == "pong:ping" ]]
 }
 tunnel_down; reset
@@ -441,21 +442,23 @@ fi
 # accept in chain output). A NEW connection from the guest into the bridge is
 # not allowed (the bridge subnet is not in the LAN set), so it must fail.
 tunnel_down; reset
-g python3 -c "$INBOUND_SERVER" 172.17.0.1 &
+ip netns exec G python3 -c "$INBOUND_SERVER" 172.17.0.1 &
 sp=$!
 sleep 0.5
 out="$(c timeout 6 python3 -c "$INBOUND_CLIENT" 172.17.0.2 172.17.0.1 2>&1)"
 wait "$sp" 2>/dev/null
+[[ -z "$(ip netns exec G ss -Hltn 'sport = :7000')" ]] || broken "leftover test server on port 7000 in G"
 if [[ "$out" == "pong:ping" ]]; then
     result ok "tunnel down: a container connects to a service on the guest over the bridge and gets its replies" "ping answered with pong"
 else
     result bad "tunnel down: a container connects to a service on the guest over the bridge and gets its replies" "got: ${out:-nothing}"
 fi
-c python3 -c "$INBOUND_SERVER" 172.17.0.2 &
+ip netns exec C python3 -c "$INBOUND_SERVER" 172.17.0.2 &
 sp=$!
 sleep 0.5
 out="$(g timeout 4 python3 -c "$INBOUND_CLIENT" 172.17.0.1 172.17.0.2 2>&1)"
 kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+[[ -z "$(ip netns exec C ss -Hltn 'sport = :7000')" ]] || broken "leftover test server on port 7000 in C"
 if [[ "$out" != "pong:ping" ]]; then
     result ok "tunnel down: a NEW connection from the guest into the container bridge is dropped (bridge subnet is not in the LAN set)" "no answer, as documented"
 else
@@ -482,13 +485,14 @@ table ip pub {
     }
 }
 EOF2
-c python3 -c "$INBOUND_SERVER" 172.17.0.2 &
+ip netns exec C python3 -c "$INBOUND_SERVER" 172.17.0.2 &
 sp=$!
 sleep 0.5
 out="$(timeout 6 python3 -c 'import socket
 s = socket.create_connection(("192.168.50.2", 7100), timeout=3, source_address=("192.168.50.1", 0))
 s.sendall(b"ping"); s.settimeout(3); print(s.recv(100).decode())' 2>&1)"
 kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+[[ -z "$(ip netns exec C ss -Hltn 'sport = :7000')" ]] || broken "leftover test server on port 7000 in C"
 if [[ "$out" == "pong:ping" ]]; then
     result ok "tunnel down: a published port (LAN -> DNAT -> container) works and the replies come back" "ping answered with pong"
 else
@@ -497,7 +501,7 @@ fi
 # 2b. The answers to an INTERNET client of a published port go out the uplink,
 # not the tunnel: with the tunnel down they must be dropped (as on eth0). On a
 # br-* uplink the bridge-name accepts used to let them leave (client got a RST).
-c python3 -c "$INBOUND_SERVER" 172.17.0.2 &
+ip netns exec C python3 -c "$INBOUND_SERVER" 172.17.0.2 &
 sp=$!
 sleep 0.5
 reset
@@ -506,6 +510,7 @@ s = socket.create_connection(("192.168.50.2", 7100), timeout=2, source_address=(
 sleep 0.3
 n="$(count phys_inet)"
 kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+[[ -z "$(ip netns exec C ss -Hltn 'sport = :7000')" ]] || broken "leftover test server on port 7000 in C"
 if [[ "$n" == 0 ]]; then
     result ok "tunnel down: replies to an internet client of a published port do not leave the uplink" "0 packets on the physical side"
 else
@@ -515,11 +520,12 @@ fi
 # while the tunnel is up.
 tunnel_up
 ip route add 172.17.0.0/24 via 100.64.0.2 dev wts 2>/dev/null
-c python3 -c "$INBOUND_SERVER" 172.17.0.2 &
+ip netns exec C python3 -c "$INBOUND_SERVER" 172.17.0.2 &
 sp=$!
 sleep 0.5
 out="$(timeout 6 python3 -c "$INBOUND_CLIENT" 100.64.0.1 172.17.0.2 2>&1)"
 kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+[[ -z "$(ip netns exec C ss -Hltn 'sport = :7000')" ]] || broken "leftover test server on port 7000 in C"
 if [[ "$out" == "pong:ping" ]]; then
     result ok "tunnel up: a tunnel peer reaches a container IP directly (subnet router, no DNAT)" "ping answered with pong"
 else
@@ -536,11 +542,12 @@ c2 ip link set lo up
 c2 ip addr add 172.18.0.2/24 dev c2veth
 c2 ip link set c2veth up
 c2 ip route add default via 172.18.0.1
-c2 python3 -c "$INBOUND_SERVER" 172.18.0.2 &
+ip netns exec C2 python3 -c "$INBOUND_SERVER" 172.18.0.2 &
 sp=$!
 sleep 0.5
 out="$(c timeout 6 python3 -c "$INBOUND_CLIENT" 172.17.0.2 172.18.0.2 2>&1)"
 kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+[[ -z "$(ip netns exec C2 ss -Hltn 'sport = :7000')" ]] || broken "leftover test server on port 7000 in C2"
 if [[ "$out" == "pong:ping" ]]; then
     result ok "tunnel down: container to container across two bridges works" "ping answered with pong"
 else
